@@ -1,11 +1,13 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const posix = std.posix;
-const net = std.net;
+const net = std.Io.net;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
-const Mutex = Thread.Mutex;
+const Mutex = std.Io.Mutex;
 const Atomic = std.atomic.Value;
+const builtin = @import("builtin");
+
+const Logger = @import("../misc/Logger.zig").Logger;
 
 pub const SocketError = error{
     WinsockInitFailed,
@@ -18,11 +20,11 @@ pub const SocketError = error{
     AddressParseError,
     SocketClosed,
     OutOfMemory,
-} || std.net.Address.ListenError || std.posix.SocketError || std.posix.BindError || std.posix.SendToError;
+} || net.IpAddress.ListenError || net.IpAddress.BindError || net.IpAddress.ConnectError || net.Socket.SendError || net.Socket.ReceiveError;
 
 pub const CallbackFn = *const fn (
     data: []u8,
-    from_addr: std.net.Address,
+    from_addr: net.IpAddress,
     context: ?*anyopaque,
     allocator: Allocator,
 ) void;
@@ -52,19 +54,21 @@ const PacketBuffer = struct {
 };
 
 const BufferPool = struct {
+    io: std.Io,
     buffers: []PacketBuffer,
     mutex: Mutex,
     allocator: Allocator,
 
-    fn init(allocator: Allocator, pool_size: usize) !BufferPool {
+    fn init(io: std.Io, allocator: Allocator, pool_size: usize) !BufferPool {
         const buffers = try allocator.alloc(PacketBuffer, pool_size);
         for (buffers) |*buffer| {
             buffer.used = false;
         }
 
         return BufferPool{
+            .io = io,
             .buffers = buffers,
-            .mutex = Mutex{},
+            .mutex = Mutex.init,
             .allocator = allocator,
         };
     }
@@ -74,8 +78,11 @@ const BufferPool = struct {
     }
 
     fn acquire(self: *BufferPool) ?*PacketBuffer {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lock(self.io) catch |err| {
+            Logger.WARN("mutex lock failed: {}", .{err});
+            return null;
+        };
+        defer self.mutex.unlock(self.io);
 
         for (self.buffers) |*buffer| {
             if (!buffer.used) {
@@ -87,8 +94,12 @@ const BufferPool = struct {
     }
 
     fn release(self: *BufferPool, buffer: *PacketBuffer) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lock(self.io) catch |err| {
+            Logger.WARN("mutex lock failed: {}", .{err});
+            return;
+        };
+        defer self.mutex.unlock(self.io);
+
         buffer.used = false;
     }
 };
@@ -97,8 +108,10 @@ pub const Socket = struct {
     const Self = @This();
 
     // Core socket data
+    io: std.Io,
     allocator: Allocator,
-    bind_address: std.net.Address,
+    bind_address: net.IpAddress,
+    _socket: net.Socket = undefined,
     socket_handle: SocketHandle,
 
     // Threading
@@ -120,17 +133,18 @@ pub const Socket = struct {
     // Platform-specific
     winsock_initialized: if (builtin.os.tag == .windows) bool else void,
 
-    pub fn init(allocator: Allocator, host: []const u8, port: u16) SocketError!Self {
+    pub fn init(io: std.Io, allocator: Allocator, host: []const u8, port: u16) SocketError!Self {
         const bind_address = parseAddress(host, port) catch |err| {
             std.log.err("Failed to parse address {s}:{d}: {any}", .{ host, port, err });
             return SocketError.AddressParseError;
         };
 
-        var buffer_pool = BufferPool.init(allocator, 64) catch {
+        var buffer_pool = BufferPool.init(io, allocator, 64) catch {
             return SocketError.OutOfMemory;
         };
 
         var self = Self{
+            .io = io,
             .allocator = allocator,
             .bind_address = bind_address,
             .socket_handle = if (builtin.os.tag == .windows)
@@ -142,7 +156,7 @@ pub const Socket = struct {
             .is_listening = Atomic(bool).init(false),
             .callback = null,
             .context = null,
-            .callback_mutex = Mutex{},
+            .callback_mutex = Mutex.init,
             .buffer_pool = buffer_pool,
             .consecutive_errors = Atomic(u32).init(0),
             .winsock_initialized = if (builtin.os.tag == .windows) false else {},
@@ -156,98 +170,19 @@ pub const Socket = struct {
         return self;
     }
 
-    fn parseAddress(host: []const u8, port: u16) !std.net.Address {
+    fn parseAddress(host: []const u8, port: u16) !net.IpAddress {
         if (std.mem.eql(u8, host, "0.0.0.0") or host.len == 0) {
-            return std.net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, port);
+            return net.IpAddress.parseIp4("0.0.0.0", port);
         }
-        return std.net.Address.parseIp4(host, port);
+        return net.IpAddress.parseIp4(host, port);
     }
 
     fn createSocket(self: *Self) SocketError!void {
-        if (builtin.os.tag == .windows) {
-            try self.initWinsock();
-            try self.createWindowsSocket();
-        } else {
-            try self.createUnixSocket();
-        }
-    }
-
-    fn createWindowsSocket(self: *Self) SocketError!void {
-        const sock = std.os.windows.ws2_32.socket(
-            std.os.windows.ws2_32.AF.INET,
-            std.os.windows.ws2_32.SOCK.DGRAM,
-            std.os.windows.ws2_32.IPPROTO.UDP,
-        );
-
-        if (sock == std.os.windows.ws2_32.INVALID_SOCKET) {
-            self.cleanupWinsock();
-            return SocketError.SocketCreationFailed;
-        }
-
-        // Set socket options for better performance
-        self.setWindowsSocketOptions(sock) catch {
-            _ = std.os.windows.ws2_32.closesocket(sock);
-            self.cleanupWinsock();
-            return SocketError.SocketCreationFailed;
-        };
-
-        self.socket_handle = sock;
-    }
-
-    fn setWindowsSocketOptions(_: *Self, sock: SocketHandle) !void {
-        // Non-blocking mode
-        var mode: c_ulong = 1;
-        if (std.os.windows.ws2_32.ioctlsocket(sock, std.os.windows.ws2_32.FIONBIO, &mode) != 0) {
-            return error.SocketCreationFailed;
-        }
-
-        // Increase receive buffer size
-        const recv_buf_size: c_int = 4 * 1024 * 1024; // 4MB for better performance
-        _ = std.os.windows.ws2_32.setsockopt(
-            sock,
-            0x0000ffff, // SOL_SOCKET
-            0x1002, // SO_RCVBUF
-            @ptrCast(&recv_buf_size),
-            @sizeOf(c_int),
-        );
-
-        // Set receive timeout
-        const timeout_ms: c_int = Config.SOCKET_RECV_TIMEOUT_MS;
-        _ = std.os.windows.ws2_32.setsockopt(
-            sock,
-            0x0000ffff, // SOL_SOCKET
-            0x1006, // SO_RCVTIMEO
-            @ptrCast(&timeout_ms),
-            @sizeOf(c_int),
-        );
-
-        // Add send buffer size
-        const send_buf_size: c_int = 4 * 1024 * 1024; // 4MB
-        _ = std.os.windows.ws2_32.setsockopt(
-            sock,
-            0x0000ffff, // SOL_SOCKET
-            0x1001, // SO_SNDBUF
-            @ptrCast(&send_buf_size),
-            @sizeOf(c_int),
-        );
-    }
-
-    fn createUnixSocket(self: *Self) SocketError!void {
-        const sock = posix.socket(
-            posix.AF.INET,
-            posix.SOCK.DGRAM | std.os.linux.SOCK.NONBLOCK | std.os.linux.SOCK.CLOEXEC,
-            0,
-        ) catch |err| {
-            std.log.err("Failed to create socket: {any}", .{err});
-            return err;
-        };
-
-        self.setUnixSocketOptions(sock) catch {
-            _ = posix.close(sock);
-            return SocketError.SocketCreationFailed;
-        };
-
-        self.socket_handle = sock;
+        self._socket = try self.bind_address.bind(self.io, .{
+            .allow_broadcast = true,
+            .mode = .dgram,
+            .protocol = .udp,
+        });
     }
 
     fn setUnixSocketOptions(_: *Self, sock: SocketHandle) !void {
@@ -271,32 +206,14 @@ pub const Socket = struct {
         _ = posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buf_size)) catch {};
 
         // Make sure non-blocking is set
-        const flags = posix.fcntl(sock, posix.F.GETFL, 0) catch return;
-        _ = posix.fcntl(sock, posix.F.SETFL, flags | posix.SOCK.NONBLOCK) catch return;
-    }
-
-    fn initWinsock(self: *Self) SocketError!void {
-        if (builtin.os.tag != .windows or self.winsock_initialized) return;
-
-        var wsadata = std.mem.zeroes(std.os.windows.ws2_32.WSADATA);
-        if (std.os.windows.ws2_32.WSAStartup(0x0202, &wsadata) != 0) {
-            return SocketError.WinsockInitFailed;
-        }
-        self.winsock_initialized = true;
-    }
-
-    fn cleanupWinsock(self: *Self) void {
-        if (builtin.os.tag != .windows or !self.winsock_initialized) return;
-        _ = std.os.windows.ws2_32.WSACleanup();
-        self.winsock_initialized = false;
+        const flags = posix.system.fcntl(sock, posix.F.GETFL, 0) catch return;
+        _ = posix.system.fcntl(sock, posix.F.SETFL, flags | posix.SOCK.NONBLOCK) catch return;
     }
 
     pub fn listen(self: *Self) SocketError!void {
         if (self.is_listening.load(.acquire)) {
             return SocketError.AlreadyListening;
         }
-
-        try self.bindSocket();
 
         self.should_stop.store(false, .release);
         self.consecutive_errors.store(0, .release);
@@ -308,28 +225,6 @@ pub const Socket = struct {
 
         self.is_listening.store(true, .release);
         // std.log.info("Socket listening on {any}", .{self.bind_address});
-    }
-
-    fn bindSocket(self: *Self) SocketError!void {
-        if (builtin.os.tag == .windows) {
-            const result = std.os.windows.ws2_32.bind(
-                self.socket_handle,
-                @ptrCast(&self.bind_address.in),
-                @sizeOf(@TypeOf(self.bind_address.in)),
-            );
-            if (result == std.os.windows.ws2_32.SOCKET_ERROR) {
-                return SocketError.BindFailed;
-            }
-        } else {
-            posix.bind(
-                self.socket_handle,
-                &self.bind_address.any,
-                self.bind_address.getOsSockLen(),
-            ) catch |err| {
-                std.log.err("Socket bind failed: {any}", .{err});
-                return err;
-            };
-        }
     }
 
     // Improved receive loop with CPU-efficient adaptive sleeping
@@ -392,21 +287,30 @@ pub const Socket = struct {
             // Adaptive sleep strategy based on system activity
             if (buffer_shortage) {
                 // Sleep briefly to let buffers free up
-                std.Thread.sleep(current_sleep_ns / 2);
+                self.io.sleep(.fromNanoseconds(@intCast(current_sleep_ns / 2)), .awake) catch |err| {
+                    Logger.WARN("sleep interrupted: {}", .{err});
+                    return;
+                };
             } else if (packets_processed == 0) {
                 // No packets processed, use adaptive sleep
-                std.Thread.sleep(current_sleep_ns);
+                self.io.sleep(.fromNanoseconds(@intCast(current_sleep_ns)), .awake) catch |err| {
+                    Logger.WARN("sleep interrupted: {}", .{err});
+                    return;
+                };
             }
             // When packets were processed, loop immediately without sleeping
         }
     }
 
     // More efficient packet handling with better memory management
-    fn handlePacket(self: *Self, data: []const u8, from_addr: std.net.Address) void {
-        self.callback_mutex.lock();
+    fn handlePacket(self: *Self, data: []const u8, from_addr: net.IpAddress) void {
+        self.callback_mutex.lock(self.io) catch |err| {
+            Logger.WARN("mutex lock failed: {}", .{err});
+            return;
+        };
         const callback = self.callback;
         const context = self.context;
-        self.callback_mutex.unlock();
+        self.callback_mutex.unlock(self.io);
 
         if (callback) |cb| {
             // Create a copy of the data that will be freed by the callback
@@ -429,10 +333,10 @@ pub const Socket = struct {
         } else if (error_count == 5 or error_count % 100 == 0) {
             // Only log periodically after many errors
             std.log.err("Network errors continuing (count: {d}), client likely disconnected", .{error_count});
-            std.Thread.sleep(Config.IDLE_SLEEP_NS); // Longer backoff
+            self.io.sleep(.fromNanoseconds(@intCast(Config.IDLE_SLEEP_NS)), .awake) catch return; // Longer backoff
         } else {
             // Just back off without logging
-            std.Thread.sleep(Config.BASE_SLEEP_NS * 5);
+            self.io.sleep(.fromNanoseconds(@intCast(Config.BASE_SLEEP_NS * 5)), .awake) catch return;
         }
     }
 
@@ -445,82 +349,17 @@ pub const Socket = struct {
 
     const PacketInfo = struct {
         data: []const u8,
-        from_addr: std.net.Address,
+        from_addr: net.IpAddress,
     };
 
     fn receivePacket(self: *Self, buffer: []u8) ReceiveResult {
-        if (builtin.os.tag == .windows) {
-            return self.receivePacketWindows(buffer);
-        } else {
-            return self.receivePacketUnix(buffer);
-        }
-    }
-
-    fn receivePacketWindows(self: *Self, buffer: []u8) ReceiveResult {
-        var from_addr: @TypeOf(self.bind_address.in) = undefined;
-        var addr_len: c_int = @sizeOf(@TypeOf(from_addr));
-
-        const result = std.os.windows.ws2_32.recvfrom(
-            self.socket_handle,
-            buffer.ptr,
-            @intCast(buffer.len),
-            0,
-            @ptrCast(&from_addr),
-            &addr_len,
-        );
-
-        if (result == std.os.windows.ws2_32.SOCKET_ERROR) {
-            const err = std.os.windows.ws2_32.WSAGetLastError();
-            return switch (err) {
-                std.os.windows.ws2_32.WinsockError.WSAEWOULDBLOCK => .would_block,
-                std.os.windows.ws2_32.WinsockError.WSAECONNRESET,
-                std.os.windows.ws2_32.WinsockError.WSAENETDOWN,
-                std.os.windows.ws2_32.WinsockError.WSAENETUNREACH,
-                => .{ .error_recoverable = error.NetworkError },
-                std.os.windows.ws2_32.WinsockError.WSAEBADF,
-                std.os.windows.ws2_32.WinsockError.WSAENOTSOCK,
-                => .{ .error_fatal = error.SocketClosed },
-                else => .{ .error_recoverable = error.ReceiveFailed },
-            };
-        }
-
-        if (result == 0) return .{ .success = null };
-
-        return .{
-            .success = PacketInfo{
-                .data = buffer[0..@intCast(result)],
-                .from_addr = std.net.Address{ .in = from_addr },
-            },
+        const msg = self._socket.receive(self.io, buffer) catch |err| {
+            return .{ .error_fatal = err };
         };
-    }
-
-    fn receivePacketUnix(self: *Self, buffer: []u8) ReceiveResult {
-        var from_addr: posix.sockaddr = undefined;
-        var addr_len: posix.socklen_t = @sizeOf(@TypeOf(from_addr));
-
-        const bytes_received = posix.recvfrom(
-            self.socket_handle,
-            buffer,
-            0,
-            &from_addr,
-            &addr_len,
-        ) catch |err| {
-            return switch (err) {
-                error.WouldBlock => .would_block,
-                error.ConnectionRefused, error.NetworkSubsystemFailed => .{ .error_recoverable = err },
-                error.SocketNotConnected => .{ .error_fatal = err },
-                else => .{ .error_recoverable = err },
-            };
-        };
-
-        if (bytes_received == 0) return .{ .success = null };
-
-        return .{
-            .success = PacketInfo{
-                .data = buffer[0..bytes_received],
-                .from_addr = std.net.Address{ .any = from_addr },
-            },
-        };
+        return .{ .success = .{
+            .data = buffer[0..msg.data.len],
+            .from_addr = msg.from,
+        } };
     }
 
     pub fn stop(self: *Self) void {
@@ -539,52 +378,22 @@ pub const Socket = struct {
 
     pub fn deinit(self: *Self) void {
         self.stop();
-
-        if (builtin.os.tag == .windows) {
-            if (self.socket_handle != std.os.windows.ws2_32.INVALID_SOCKET) {
-                _ = std.os.windows.ws2_32.closesocket(self.socket_handle);
-            }
-            self.cleanupWinsock();
-        } else {
-            _ = posix.close(self.socket_handle);
-        }
-
+        self._socket.close(self.io);
         self.buffer_pool.deinit();
     }
 
     pub fn setCallback(self: *Self, callback: CallbackFn, context: ?*anyopaque) void {
-        self.callback_mutex.lock();
-        defer self.callback_mutex.unlock();
+        self.callback_mutex.lock(self.io) catch |err| {
+            Logger.WARN("mutex lock failed: {}", .{err});
+            return;
+        };
+        defer self.callback_mutex.unlock(self.io);
         self.callback = callback;
         self.context = context;
     }
 
-    pub fn send(self: *Self, data: []const u8, to_addr: std.net.Address) SocketError!void {
-        if (builtin.os.tag == .windows) {
-            const result = std.os.windows.ws2_32.sendto(
-                self.socket_handle,
-                data.ptr,
-                @intCast(data.len),
-                0,
-                @ptrCast(&to_addr.in),
-                @sizeOf(@TypeOf(to_addr.in)),
-            );
-
-            if (result == std.os.windows.ws2_32.SOCKET_ERROR) {
-                return SocketError.SendFailed;
-            }
-        } else {
-            _ = posix.sendto(
-                self.socket_handle,
-                data,
-                0,
-                &to_addr.any,
-                to_addr.getOsSockLen(),
-            ) catch |err| {
-                std.log.err("sendto failed: {any}", .{err});
-                return err;
-            };
-        }
+    pub fn send(self: *Self, data: []const u8, to_addr: net.IpAddress) SocketError!void {
+        try self._socket.send(self.io, &to_addr, data);
     }
 
     pub fn sendTo(self: *Self, data: []const u8, host: []const u8, port: u16) SocketError!void {
@@ -595,30 +404,8 @@ pub const Socket = struct {
         try self.send(data, addr);
     }
 
-    pub fn getLocalAddress(self: *Self) SocketError!std.net.Address {
-        if (builtin.os.tag == .windows) {
-            var addr: @TypeOf(self.bind_address.in) = undefined;
-            var addr_len: c_int = @sizeOf(@TypeOf(addr));
-
-            if (std.os.windows.ws2_32.getsockname(
-                self.socket_handle,
-                @ptrCast(&addr),
-                &addr_len,
-            ) == std.os.windows.ws2_32.SOCKET_ERROR) {
-                return SocketError.SocketCreationFailed;
-            }
-
-            return std.net.Address{ .in = addr };
-        } else {
-            var addr: posix.sockaddr = undefined;
-            var addr_len: posix.socklen_t = @sizeOf(@TypeOf(addr));
-
-            posix.getsockname(self.socket_handle, &addr, &addr_len) catch {
-                return SocketError.SocketCreationFailed;
-            };
-
-            return std.net.Address{ .any = addr };
-        }
+    pub fn getLocalAddress(self: *Self) net.IpAddress {
+        return self._socket.address;
     }
 
     pub fn isListening(self: *Self) bool {

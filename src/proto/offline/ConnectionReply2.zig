@@ -40,7 +40,7 @@ pub const ConnectionReply2 = struct {
         try self.stream.write(address_buffer);
         try self.stream.writeUint16(self.mtu, .Big);
         try self.stream.writeBool(self.encryption_enabled);
-        return self.stream.payload.items;
+        return self.stream.getBuffer();
     }
 
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectionReply2 {

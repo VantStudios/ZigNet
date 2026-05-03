@@ -19,7 +19,7 @@ pub const FrameSet = struct {
         };
     }
 
-    pub fn serialize(self: *FrameSet) ![]u8 {
+    pub fn serialize(self: *FrameSet) ![]const u8 {
         try self.stream.writeUint8(Packets.FrameSet);
         try self.stream.writeUint24(self.sequence_number, .Little);
 
@@ -27,7 +27,7 @@ pub const FrameSet = struct {
             try frame.write(&self.stream);
         }
 
-        return self.stream.payload.items;
+        return self.stream.getBuffer();
     }
 
     pub fn deserialize(buffer: []const u8, allocator: std.mem.Allocator) !FrameSet {
@@ -40,7 +40,7 @@ pub const FrameSet = struct {
         var frames = std.ArrayList(Frame).initBuffer(&[_]Frame{});
         errdefer frames.deinit(allocator);
 
-        const end_position = stream.payload.items.len;
+        const end_position = stream.written;
         while (stream.offset < end_position) {
             const frame = try Frame.read(&stream);
             try frames.append(allocator, frame);

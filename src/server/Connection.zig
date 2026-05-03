@@ -3,6 +3,7 @@ const Server = @import("./Server.zig").Server;
 const Proto = @import("../proto/root.zig");
 const Frame = Proto.Frame;
 const Reliability = Proto.Reliability;
+const Timestamp = std.Io.Timestamp;
 const Logger = @import("../misc/Logger.zig").Logger;
 const MAX_ACTIVE_FRAGMENTATIONS = 32;
 const MAX_ORDERING_QUEUE_SIZE = 64;
@@ -16,23 +17,23 @@ pub const GamePacketCallback = *const fn (connection: *Connection, payload: []co
 pub const Connection = struct {
     const Self = @This();
     server: *Server,
-    address: std.net.Address,
+    address: std.Io.net.IpAddress,
     key: i64,
     mtu_size: u16,
     guid: i64,
     connected: bool,
     active: bool,
     comm_data: CommData,
-    last_receive: i64,
-    created_at: i64,
+    last_receive: Timestamp,
+    created_at: Timestamp,
     game_packet_callback: ?GamePacketCallback,
     game_packet_context: ?*anyopaque,
     tickCounter: u64 = 0,
-    last_ping_time: i64 = 0,
-    ping_interval: i64 = 5000,
-    send_mutex: std.Thread.Mutex = .{},
+    last_ping_time: std.Io.Timestamp = .zero,
+    ping_interval: std.Io.Duration = .fromMilliseconds(5000),
+    send_mutex: std.Io.Mutex = .init,
 
-    pub fn init(server: *Server, address: std.net.Address, mtu_size: u16, guid: i64) !Self {
+    pub fn init(server: *Server, address: std.Io.net.IpAddress, mtu_size: u16, guid: i64) !Self {
         var input_ordering_queue = std.AutoHashMap(u32, std.AutoHashMap(u32, Frame)).init(server.options.allocator);
         var i: u32 = 0;
         while (i < MAX_ACTIVE_FRAGMENTATIONS) : (i += 1) {
@@ -61,8 +62,8 @@ pub const Connection = struct {
                 .output_split_index = 0,
                 .fragments_queue = std.AutoHashMap(u16, std.AutoHashMap(u16, Frame)).init(server.options.allocator),
             },
-            .last_receive = std.time.milliTimestamp(),
-            .created_at = std.time.milliTimestamp(),
+            .last_receive = Timestamp.now(server.io, .real),
+            .created_at = Timestamp.now(server.io, .real),
             .game_packet_callback = null,
             .game_packet_context = null,
         };
@@ -74,7 +75,7 @@ pub const Connection = struct {
     }
 
     pub fn handlePacket(self: *Self, payload: []const u8) !void {
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
         const ID = payload[0];
         // Logger.INFO("Received Packet {d}", .{ID});
         const allocator = self.server.options.allocator;
@@ -85,7 +86,14 @@ pub const Connection = struct {
                 var request = try Proto.ConnectionRequest.deserialize(payload, allocator);
                 defer request.deinit();
                 const empty_address = Proto.Address.init(4, "0.0.0.0", 0);
-                var accepted = Proto.ConnectionRequestAccepted.init(empty_address, 0, empty_address, request.timestamp, std.time.milliTimestamp(), allocator);
+                var accepted = Proto.ConnectionRequestAccepted.init(
+                    empty_address,
+                    0,
+                    empty_address,
+                    request.timestamp,
+                    Timestamp.now(self.server.io, .real).toMilliseconds(),
+                    allocator,
+                );
                 defer accepted.deinit(allocator);
                 const serialized = try accepted.serialize(allocator);
                 const frame = frameIn(serialized, allocator);
@@ -93,9 +101,9 @@ pub const Connection = struct {
             },
             Proto.Packets.NewIncomingConnection => {
                 self.connected = true;
-                const elapsed = std.time.milliTimestamp() - self.created_at;
+                const elapsed = self.created_at.durationTo(.now(self.server.io, .real));
                 if (DEBUG)
-                    Logger.DEBUG("Connection established in {d}ms", .{elapsed});
+                    Logger.DEBUG("Connection established in {d}ms", .{elapsed.toMilliseconds()});
                 // Trigger server connect callback
                 if (self.server.connect_callback) |callback| {
                     callback(self, self.server.connect_context);
@@ -119,8 +127,8 @@ pub const Connection = struct {
                     return;
                 };
                 defer ping.deinit();
-                const current_time = std.time.milliTimestamp();
-                var pong = Proto.ConnectedPong.init(ping.timestamp, current_time, allocator);
+                const current_time_ms = Timestamp.now(self.server.io, .real).toMilliseconds();
+                var pong = Proto.ConnectedPong.init(ping.timestamp, current_time_ms, allocator);
                 defer pong.deinit();
 
                 const serialized = pong.serialize() catch |err| {
@@ -139,8 +147,8 @@ pub const Connection = struct {
                     return;
                 };
                 defer pong.deinit();
-                const current_time = std.time.milliTimestamp();
-                const rtt = current_time - pong.timestamp; // Round trip time
+                const current_time_ms = Timestamp.now(self.server.io, .real).toMilliseconds();
+                const rtt = current_time_ms - pong.timestamp; // Round trip time
                 if (DEBUG)
                     Logger.DEBUG("Received ConnectedPong - RTT: {d}ms", .{rtt});
             },
@@ -148,18 +156,19 @@ pub const Connection = struct {
                 Logger.WARN("Unhandeled Packet {d}", .{ID});
             },
         }
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: handlePacket took {d} ms", .{elapsed});
+        if (start_time) |start| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const elapsed = start.durationTo(end_time);
+            Logger.DEBUG("PERF: handlePacket took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn tick(self: *Connection) void {
         if (!self.active) return;
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
+        const elapsed = self.last_receive.durationTo(.now(self.server.io, .real));
 
-        if (self.last_receive + 15000 < std.time.milliTimestamp()) {
+        if (elapsed.toMilliseconds() > 15000) {
             Logger.WARN("Connection {any} has not received any packets in 15000ms", .{self.address});
             self.active = false;
             return;
@@ -169,7 +178,11 @@ pub const Connection = struct {
 
         const MAX_FRAMES_PER_TICK: usize = 128;
         var frames_sent_this_tick: usize = 0;
-        self.send_mutex.lock();
+        self.send_mutex.lock(self.server.io) catch |err| {
+            Logger.WARN("mutex lock failed: {}", .{err});
+            return;
+        };
+
         while (self.comm_data.output_frame_queue.items.len > 0 and frames_sent_this_tick < MAX_FRAMES_PER_TICK) {
             const before_len = self.comm_data.output_frame_queue.items.len;
             const batch = @min(MAX_FRAMES_PER_TICK - frames_sent_this_tick, before_len);
@@ -177,7 +190,7 @@ pub const Connection = struct {
             if (self.comm_data.output_frame_queue.items.len >= before_len) break;
             frames_sent_this_tick += before_len - self.comm_data.output_frame_queue.items.len;
         }
-        self.send_mutex.unlock();
+        self.send_mutex.unlock(self.server.io);
         if (self.comm_data.received_sequences.count() > 0) {
             var sequences_list = std.ArrayList(u32).initBuffer(&[_]u32{});
             defer sequences_list.deinit(allocator);
@@ -223,8 +236,9 @@ pub const Connection = struct {
 
         // Send ping every ping_interval milliseconds if connected
         if (self.connected) {
-            const current_time = std.time.milliTimestamp();
-            if (current_time - self.last_ping_time >= self.ping_interval) {
+            const current_time = std.Io.Timestamp.now(self.server.io, .awake);
+            const since_last_ping = self.last_ping_time.durationTo(current_time);
+            if (since_last_ping.nanoseconds >= self.ping_interval.nanoseconds) {
                 self.sendPing();
                 self.last_ping_time = current_time;
             }
@@ -232,16 +246,16 @@ pub const Connection = struct {
 
         self.tickCounter += 1;
 
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: tick took {d} ms", .{elapsed});
+        if (start_time) |start| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const tick_elapsed = start.durationTo(end_time);
+            Logger.DEBUG("PERF: tick took {d} ms", .{tick_elapsed.toMilliseconds()});
         }
     }
 
     pub fn handleAck(self: *Self, payload: []const u8) !void {
         if (!self.active) return;
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
 
         var ack = try Proto.Ack.deserialize(payload, self.server.options.allocator);
         defer ack.deinit();
@@ -258,16 +272,16 @@ pub const Connection = struct {
             }
         }
 
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: handleAck took {d} ms", .{elapsed});
+        if (start_time) |start| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const elapsed = start.durationTo(end_time);
+            Logger.DEBUG("PERF: handleAck took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn handleNack(self: *Self, payload: []const u8) !void {
         if (!self.active) return;
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
 
         // Ack and Nack are same just different ids we do not check ids when deserializing so we can do this! :D
         var nack = try Proto.Ack.deserialize(payload, self.server.options.allocator);
@@ -283,18 +297,18 @@ pub const Connection = struct {
             }
         }
 
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: handleNack took {d} ms", .{elapsed});
+        if (start_time) |start| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const elapsed = start.durationTo(end_time);
+            Logger.DEBUG("PERF: handleNack took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn onFrameSet(self: *Self, buffer: []const u8) !void {
         if (!self.active) return;
 
-        self.last_receive = std.time.milliTimestamp();
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        self.last_receive = Timestamp.now(self.server.io, .awake);
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .new(self.server.io, .real) else null;
 
         var frameSet = try Proto.FrameSet.deserialize(buffer, self.server.options.allocator);
         defer frameSet.deinit(self.server.options.allocator);
@@ -324,16 +338,16 @@ pub const Connection = struct {
             try self.handleFrame(frame);
         }
 
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: onFrameSet took {d} ms", .{elapsed});
+        if (start_time) |s_time| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const elapsed = s_time.durationTo(end_time);
+            Logger.DEBUG("PERF: onFrameSet took {d} ms", .{elapsed.toMicroseconds()});
         }
     }
 
     pub fn handleFrame(self: *Connection, frame: Frame) !void {
         if (!self.active) return;
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
 
         if (frame.payload.len == 0) {
             Logger.WARN("Frame has empty payload - skipping in handleFrame", .{});
@@ -353,16 +367,16 @@ pub const Connection = struct {
             };
         }
 
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: handleFrame took {d} ms", .{elapsed});
+        if (start_time) |start| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const elapsed = start.durationTo(end_time);
+            Logger.DEBUG("PERF: handleFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn handleOrderedFrame(self: *Connection, frame: Frame) void {
         if (!self.active) return;
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
 
         if (DEBUG)
             Logger.DEBUG("Ordered Frame!", .{});
@@ -427,15 +441,15 @@ pub const Connection = struct {
             };
         }
 
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: handleOrderedFrame took {d} ms", .{elapsed});
+        if (start_time) |start| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const elapsed = start.durationTo(end_time);
+            Logger.DEBUG("PERF: handleOrderedFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn handleSequencedFrame(self: *Self, frame: Frame) void {
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
 
         const channel = frame.order_channel orelse 0;
         if (channel >= MAX_ACTIVE_FRAGMENTATIONS) {
@@ -460,10 +474,10 @@ pub const Connection = struct {
             };
         }
 
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: handleSequencedFrame took {d} ms", .{elapsed});
+        if (start_time) |start| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const elapsed = start.durationTo(end_time);
+            Logger.DEBUG("PERF: handleSequencedFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
@@ -613,10 +627,13 @@ pub const Connection = struct {
             return;
         }
 
-        self.send_mutex.lock();
-        defer self.send_mutex.unlock();
+        self.send_mutex.lock(self.server.io) catch |err| {
+            Logger.WARN("mutex lock failed: {}", .{err});
+            return;
+        };
+        defer self.send_mutex.unlock(self.server.io);
 
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
 
         const channel_index = frame.order_channel orelse 0;
         const channel = @as(usize, channel_index);
@@ -641,18 +658,18 @@ pub const Connection = struct {
             }
             self.queueFrame(mutable_frame, priority);
 
-            if (PERFORM_TIME_CHECKS) {
-                const end_time = std.time.milliTimestamp();
-                const elapsed = end_time - start_time;
-                Logger.DEBUG("PERF: sendFrame took {d} ms", .{elapsed});
+            if (start_time) |start| {
+                const end_time = Timestamp.now(self.server.io, .awake);
+                const elapsed = start.durationTo(end_time);
+                Logger.DEBUG("PERF: sendFrame took {d} ms", .{elapsed.toMilliseconds()});
             }
 
             return;
         } else {
-            if (PERFORM_TIME_CHECKS) {
-                const end_time = std.time.milliTimestamp();
-                const elapsed = end_time - start_time;
-                Logger.DEBUG("PERF: sendFrame (large payload path) took {d} ms", .{elapsed});
+            if (start_time) |start| {
+                const end_time = Timestamp.now(self.server.io, .awake);
+                const elapsed = start.durationTo(end_time);
+                Logger.DEBUG("PERF: sendFrame (large payload path) took {d} ms", .{elapsed.toMilliseconds()});
             }
 
             const split_size = (payload_size + max_size - 1) / max_size;
@@ -700,7 +717,7 @@ pub const Connection = struct {
     }
 
     pub fn queueFrame(self: *Connection, frame: Frame, priority: Priority) void {
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
 
         // Don't queue frames if connection is not active - prevents leaks during shutdown
         if (!self.active) {
@@ -720,15 +737,15 @@ pub const Connection = struct {
             self.sendQueue(queue_len);
         }
 
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: queueFrame took {d} ms", .{elapsed});
+        if (start_time) |start| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const elapsed = start.durationTo(end_time);
+            Logger.DEBUG("PERF: queueFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn sendQueue(self: *Connection, amount: usize) void {
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
 
         if (self.comm_data.output_frame_queue.items.len == 0) return;
         const allocator = self.server.options.allocator;
@@ -819,10 +836,10 @@ pub const Connection = struct {
         self.send(serialized);
         frameset.deinit(allocator);
 
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: sendQueue took {d} ms", .{elapsed});
+        if (start_time) |start| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const elapsed = start.durationTo(end_time);
+            Logger.DEBUG("PERF: sendQueue took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
@@ -841,12 +858,12 @@ pub const Connection = struct {
 
     pub fn send(self: *Connection, data: []const u8) void {
         // Logger.INFO("Sending data to {any}", .{self.address});
-        const start_time = if (PERFORM_TIME_CHECKS) std.time.milliTimestamp() else 0;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
         self.server.send(data, self.address);
-        if (PERFORM_TIME_CHECKS) {
-            const end_time = std.time.milliTimestamp();
-            const elapsed = end_time - start_time;
-            Logger.DEBUG("PERF: send took {d} ms", .{elapsed});
+        if (start_time) |start| {
+            const end_time = Timestamp.now(self.server.io, .awake);
+            const elapsed = start.durationTo(end_time);
+            Logger.DEBUG("PERF: send took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
@@ -871,7 +888,7 @@ pub const Connection = struct {
     /// Send a ConnectedPing packet to the client
     pub fn sendPing(self: *Connection) void {
         const allocator = self.server.options.allocator;
-        const timestamp = std.time.milliTimestamp();
+        const timestamp = Timestamp.now(self.server.io, .real).toMilliseconds();
 
         var ping = Proto.ConnectedPing.init(timestamp, allocator);
         defer ping.deinit();

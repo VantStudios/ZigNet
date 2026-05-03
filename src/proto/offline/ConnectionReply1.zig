@@ -49,7 +49,7 @@ pub const ConnectionReply1 = struct {
         try self.stream.writeInt64(self.guid, .Big);
         try self.stream.writeBool(self.hasSecurity);
         try self.stream.writeUint16(self.mtu_size, .Big);
-        return self.stream.payload.items;
+        return self.stream.getBuffer();
     }
 
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectionReply1 {
@@ -72,7 +72,7 @@ pub const ConnectionReply1 = struct {
         };
 
         if (hasSecurity) {
-            const remaining = stream.payload.items.len - stream.offset;
+            const remaining = stream.written - stream.offset;
 
             if (remaining >= 1 + 4 + 294 + 2) {
                 result.has_cookie = try stream.readBool();

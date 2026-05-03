@@ -52,7 +52,7 @@ pub const ConnectionRequestAccepted = struct {
         try self.stream.writeInt64(self.request_timestamp, .Big);
         try self.stream.writeInt64(self.timestamp, .Big);
 
-        return self.stream.payload.items;
+        return self.stream.getBuffer();
     }
 
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectionRequestAccepted {

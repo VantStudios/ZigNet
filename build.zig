@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
     // exe.addModule("network", b.dependency("network", .{}).module("network"));
 
     if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("ws2_32");
+        exe.root_module.linkSystemLibrary("ws2_32", .{});
         mod.linkSystemLibrary("ws2_32", .{});
     }
     b.installArtifact(exe);
@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
         .root_module = ffi_mod,
     });
     if (target.result.os.tag == .windows) {
-        ffi_lib.linkSystemLibrary("ws2_32");
+        ffi_lib.root_module.linkSystemLibrary("ws2_32", .{});
     }
     const ffi_step = b.step("ffi", "Build shared library for bun:ffi");
     const ffi_install = b.addInstallArtifact(ffi_lib, .{});

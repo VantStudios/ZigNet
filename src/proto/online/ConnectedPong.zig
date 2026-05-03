@@ -26,7 +26,7 @@ pub const ConnectedPong = struct {
         try self.stream.writeUint8(Packets.ConnectedPong);
         try self.stream.writeInt64(self.timestamp, .Big);
         try self.stream.writeInt64(self.pong_timestamp, .Big);
-        return self.stream.payload.items;
+        return self.stream.getBuffer();
     }
 
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectedPong {

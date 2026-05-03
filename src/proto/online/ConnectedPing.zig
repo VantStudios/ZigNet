@@ -23,7 +23,7 @@ pub const ConnectedPing = struct {
     pub fn serialize(self: *ConnectedPing) ![]const u8 {
         try self.stream.writeUint8(Packets.ConnectedPing);
         try self.stream.writeInt64(self.timestamp, .Big);
-        return self.stream.payload.items;
+        return self.stream.getBuffer();
     }
 
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectedPing {

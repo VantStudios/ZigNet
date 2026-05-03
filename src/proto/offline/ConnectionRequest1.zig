@@ -29,13 +29,13 @@ pub const ConnectionRequest1 = struct {
         try Int8.write(&self.stream, Packets.OpenConnectionRequest1);
         try Magic.write(&self.stream);
         try self.stream.writeUint8(@as(u8, @intCast(self.protocol)));
-        const current_size = @as(u16, @intCast(self.stream.payload.items.len));
+        const current_size = @as(u16, @intCast(self.stream.written));
         const padding_size = self.mtu_size - Server.UDP_HEADER_SIZE - current_size;
         const zeros = try allocator.alloc(u8, padding_size);
         defer allocator.free(zeros);
         @memset(zeros, 0);
         try self.stream.write(zeros);
-        return self.stream.payload.items;
+        return self.stream.getBuffer();
     }
 
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectionRequest1 {
@@ -45,7 +45,7 @@ pub const ConnectionRequest1 = struct {
         _ = try Int8.read(&stream);
         try Magic.read(&stream);
         const protocol = try stream.readUint8();
-        var mtu_size = @as(u16, @intCast(stream.payload.items.len));
+        var mtu_size = @as(u16, @intCast(stream.getBuffer()));
         if (mtu_size + Server.UDP_HEADER_SIZE <= Server.MAX_MTU_SIZE) {
             mtu_size = mtu_size + Server.UDP_HEADER_SIZE;
         } else {

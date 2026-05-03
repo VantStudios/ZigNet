@@ -34,7 +34,7 @@ pub const UnconnectedPong = struct {
         try self.stream.writeInt64(self.guid, .Big);
         try Magic.write(&self.stream);
         try self.stream.writeString16(self.message, .Big);
-        return self.stream.payload.items;
+        return self.stream.getBuffer();
     }
 
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !UnconnectedPong {

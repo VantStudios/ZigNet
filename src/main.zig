@@ -7,27 +7,28 @@ const Logger = Raknet.Logger;
 
 const SERVER = true; // true = run server, false = run client
 
-pub fn main() !void {
-    var gpa = std.heap.DebugAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
+    Logger.init(allocator);
     defer {
-        if (gpa.detectLeaks()) {
+        if (gpa.detectLeaks() > 0) {
             Logger.ERROR("Leaks detected", .{});
         } else {
             Logger.INFO("No leaks detected", .{});
         }
     }
-
     if (SERVER) {
-        try runServer(allocator);
+        try runServer(io, allocator);
     } else {
-        try runClient(allocator);
+        try runClient(io, allocator);
     }
 }
 
-fn runServer(allocator: std.mem.Allocator) !void {
+fn runServer(io: std.Io, allocator: std.mem.Allocator) !void {
     Logger.INFO("Running ZigNet Server", .{});
-    var server = try Server.init(.{
+    var server = try Server.init(io, .{
         .allocator = allocator,
     });
     defer server.deinit();
@@ -36,10 +37,10 @@ fn runServer(allocator: std.mem.Allocator) !void {
     server.setDisconnectCallback(onServerDisconnect, null);
     try server.start();
 
-    std.Thread.sleep(std.time.ns_per_s * 30);
+    try io.sleep(.fromSeconds(30), .awake);
 }
 
-fn runClient(allocator: std.mem.Allocator) !void {
+fn runClient(_: std.Io, allocator: std.mem.Allocator) !void {
     Logger.INFO("Running ZigNet Client", .{});
     var client = try Client.init(.{
         .allocator = allocator,

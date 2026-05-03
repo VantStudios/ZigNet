@@ -54,14 +54,28 @@ pub const DebugLevel = enum {
 
 var current_debug_level: DebugLevel = .None;
 
+var _io_impl: ?std.Io.Threaded = null;
+var _io: std.Io = undefined;
+
 pub const Logger = struct {
+    pub fn init(allocator: std.mem.Allocator) void {
+        if (_io_impl != null) return;
+        _io_impl = std.Io.Threaded.init(allocator, .{});
+        _io = _io_impl.?.io();
+    }
+
+    fn getIo() std.Io {
+        if (_io_impl == null) @panic("Logger not initialized - call Logger.init() first");
+        return _io;
+    }
+
     pub fn setDebugLevel(level: DebugLevel) void {
         current_debug_level = level;
     }
 
     pub fn INFO(comptime fmt: []const u8, args: anytype) void {
-        const timestamp = std.time.timestamp();
-        const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+        const timestamp = std.Io.Timestamp.now(getIo(), .real);
+        const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp.toSeconds()) };
 
         const daySeconds = localTime.getDaySeconds();
         const hour = daySeconds.getHoursIntoDay();
@@ -73,8 +87,8 @@ pub const Logger = struct {
     }
 
     pub fn ERROR(comptime fmt: []const u8, args: anytype) void {
-        const timestamp = std.time.timestamp();
-        const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+        const timestamp = std.Io.Timestamp.now(getIo(), .real);
+        const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp.toSeconds()) };
 
         const daySeconds = localTime.getDaySeconds();
         const hour = daySeconds.getHoursIntoDay();
@@ -86,8 +100,8 @@ pub const Logger = struct {
     }
 
     pub fn WARN(comptime fmt: []const u8, args: anytype) void {
-        const timestamp = std.time.timestamp();
-        const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+        const timestamp = std.Io.Timestamp.now(getIo(), .real);
+        const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp.toSeconds()) };
 
         const daySeconds = localTime.getDaySeconds();
         const hour = daySeconds.getHoursIntoDay();
@@ -101,8 +115,8 @@ pub const Logger = struct {
     pub fn DEBUG(comptime fmt: []const u8, args: anytype) void {
         if (current_debug_level == .None) return;
 
-        const timestamp = std.time.timestamp();
-        const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+        const timestamp = std.Io.Timestamp.now(getIo(), .real);
+        const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp.toSeconds()) };
 
         const daySeconds = localTime.getDaySeconds();
         const hour = daySeconds.getHoursIntoDay();
@@ -117,8 +131,8 @@ pub const Logger = struct {
     /// Returns a slice of the buffer containing the formatted time.
     /// No memory is allocated.
     pub fn writeTimeToBuffer(buffer: []u8) ![]const u8 {
-        const timestamp_s = std.time.timestamp();
-        const timestamp_ns = std.time.nanoTimestamp();
+        const timestamp_s = std.Io.Timestamp.now(getIo(), .real).toSeconds();
+        const timestamp_ns = timestamp_s.toNanoseconds();
 
         const seconds_in_day = @mod(timestamp_s, 86400);
 
@@ -141,7 +155,7 @@ pub const Logger = struct {
     /// Returns a slice of the buffer containing the formatted date.
     /// No memory is allocated.
     pub fn writeDateToBuffer(buffer: []u8) ![]const u8 {
-        const t = std.time.timestamp();
+        const t = std.Io.Timestamp.now(getIo(), .real).toSeconds();
         const d = @divFloor(t, 86400);
         var y: i32 = 1970;
         var r = d;

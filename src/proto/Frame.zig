@@ -45,8 +45,8 @@ pub const Frame = struct {
         const payload_length = (length + 7) / 8;
         const split = (flags & @intFromEnum(Flags.Split)) != 0;
 
-        if (payload_length + stream.offset > stream.payload.items.len) {
-            std.debug.print("Frame length exceeds stream length: {d} > {d}\n", .{ payload_length + stream.offset, stream.payload.items.len });
+        if (payload_length + stream.offset > stream.written) {
+            std.debug.print("Frame length exceeds stream length: {d} > {d}\n", .{ payload_length + stream.offset, stream.written });
             @panic("Frame length exceeds stream length");
         }
 

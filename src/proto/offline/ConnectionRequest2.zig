@@ -59,7 +59,7 @@ pub const ConnectionRequest2 = struct {
         try self.stream.writeUint16(self.mtu_size, .Big);
         try self.stream.writeInt64(self.guid, .Big);
 
-        return self.stream.payload.items;
+        return self.stream.getBuffer();
     }
 
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectionRequest2 {

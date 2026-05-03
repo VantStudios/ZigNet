@@ -29,7 +29,7 @@ pub const ConnectionRequest = struct {
         try self.stream.writeInt64(self.guid, .Big);
         try self.stream.writeInt64(self.timestamp, .Big);
         try self.stream.writeBool(self.use_security);
-        return self.stream.payload.items;
+        return self.stream.getBuffer();
     }
 
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectionRequest {
