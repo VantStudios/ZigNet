@@ -18,7 +18,7 @@ A high-performance RakNet implementation written in Zig, providing reliable UDP 
 Add ZigNet to your project:
 
 ```bash
-zig fetch --save git+https://github.com/SanctumTerra/ZigNet
+zig fetch --save git+https://github.com/VantStudios/ZigNet
 ```
 
 Then add it to your `build.zig`:
@@ -152,7 +152,7 @@ ZigNet implements the complete RakNet protocol including:
 
 ## Requirements
 
-- Zig 0.15.0-dev or later
+- Zig 0.16.0 or later
 - Supported platforms: Windows, Linux, macOS
 
 ## Contributing
