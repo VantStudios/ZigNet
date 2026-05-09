@@ -164,7 +164,7 @@ pub const Server = struct {
             const remaining = deadline.subDuration(.fromNanoseconds(now.nanoseconds));
             if (remaining.toMilliseconds() <= 0) return;
 
-            const remaining_ns: u64 = @intCast(remaining.toNanoseconds());
+            const remaining_ns: u64 = @intCast(remaining.nanoseconds);
             if (remaining_ns > coarse_sleep_guard_ns) {
                 io.sleep(.fromNanoseconds(@intCast(remaining_ns - coarse_sleep_guard_ns)), .awake) catch return;
                 continue;
@@ -185,7 +185,7 @@ pub const Server = struct {
         self.running = true;
         self.tick_thread = try self.io.concurrent(tickLoop, .{self});
 
-        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(Timestamp.now(self.io, .awake).toNanoseconds())));
+        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(Timestamp.now(self.io, .awake).nanoseconds)));
         self.options.advertisement.guid = prng.random().int(i64);
         self.socket.setCallback(packet_callback, self);
         self.socket.listen() catch |err| {

@@ -132,7 +132,7 @@ pub const Logger = struct {
     /// No memory is allocated.
     pub fn writeTimeToBuffer(buffer: []u8) ![]const u8 {
         const timestamp_s = std.Io.Timestamp.now(getIo(), .real).toSeconds();
-        const timestamp_ns = timestamp_s.toNanoseconds();
+        const timestamp_ns = timestamp_s.nanoseconds;
 
         const seconds_in_day = @mod(timestamp_s, 86400);
 

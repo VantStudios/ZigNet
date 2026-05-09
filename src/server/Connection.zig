@@ -62,8 +62,8 @@ pub const Connection = struct {
                 .output_split_index = 0,
                 .fragments_queue = std.AutoHashMap(u16, std.AutoHashMap(u16, Frame)).init(server.options.allocator),
             },
-            .last_receive = Timestamp.now(server.io, .real),
-            .created_at = Timestamp.now(server.io, .real),
+            .last_receive = Timestamp.now(server.io, .awake),
+            .created_at = Timestamp.now(server.io, .awake),
             .game_packet_callback = null,
             .game_packet_context = null,
         };
@@ -101,7 +101,7 @@ pub const Connection = struct {
             },
             Proto.Packets.NewIncomingConnection => {
                 self.connected = true;
-                const elapsed = self.created_at.durationTo(.now(self.server.io, .real));
+                const elapsed = self.created_at.durationTo(.now(self.server.io, .awake));
                 if (DEBUG)
                     Logger.DEBUG("Connection established in {d}ms", .{elapsed.toMilliseconds()});
                 // Trigger server connect callback
@@ -166,9 +166,10 @@ pub const Connection = struct {
     pub fn tick(self: *Connection) void {
         if (!self.active) return;
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
-        const elapsed = self.last_receive.durationTo(.now(self.server.io, .real));
+        const elapsed = self.last_receive.durationTo(.now(self.server.io, .awake));
 
         if (elapsed.toMilliseconds() > 15000) {
+            Logger.WARN("info ms {d}", .{elapsed.toMilliseconds()});
             Logger.WARN("Connection {any} has not received any packets in 15000ms", .{self.address});
             self.active = false;
             return;
@@ -308,7 +309,7 @@ pub const Connection = struct {
         if (!self.active) return;
 
         self.last_receive = Timestamp.now(self.server.io, .awake);
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .new(self.server.io, .real) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .new(self.server.io, .awake) else null;
 
         var frameSet = try Proto.FrameSet.deserialize(buffer, self.server.options.allocator);
         defer frameSet.deinit(self.server.options.allocator);
