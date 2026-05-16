@@ -29,11 +29,6 @@ pub const CallbackFn = *const fn (
     allocator: Allocator,
 ) void;
 
-const SocketHandle = if (builtin.os.tag == .windows)
-    std.os.windows.ws2_32.SOCKET
-else
-    posix.socket_t;
-
 // Configuration constants
 const Config = struct {
     const BUFFER_SIZE = 8192;
@@ -112,7 +107,6 @@ pub const Socket = struct {
     allocator: Allocator,
     bind_address: net.IpAddress,
     _socket: net.Socket = undefined,
-    socket_handle: SocketHandle,
 
     // Threading
     thread: ?Thread,
@@ -147,10 +141,6 @@ pub const Socket = struct {
             .io = io,
             .allocator = allocator,
             .bind_address = bind_address,
-            .socket_handle = if (builtin.os.tag == .windows)
-                std.os.windows.ws2_32.INVALID_SOCKET
-            else
-                undefined,
             .thread = null,
             .should_stop = Atomic(bool).init(false),
             .is_listening = Atomic(bool).init(false),
@@ -183,31 +173,6 @@ pub const Socket = struct {
             .mode = .dgram,
             .protocol = .udp,
         });
-    }
-
-    fn setUnixSocketOptions(_: *Self, sock: SocketHandle) !void {
-        // Enable address reuse
-        const enable: c_int = 1;
-        _ = posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable)) catch {};
-
-        // Increase receive buffer size
-        const recv_buf_size: c_int = 4 * 1024 * 1024; // 4MB
-        _ = posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&recv_buf_size)) catch {};
-
-        // Set receive timeout
-        const timeout = std.os.linux.timeval{
-            .sec = 0,
-            .usec = Config.SOCKET_RECV_TIMEOUT_MS * 1000,
-        };
-        _ = posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-
-        // Increase send buffer size
-        const send_buf_size: c_int = 4 * 1024 * 1024; // 4MB
-        _ = posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buf_size)) catch {};
-
-        // Make sure non-blocking is set
-        const flags = posix.system.fcntl(sock, posix.F.GETFL, 0) catch return;
-        _ = posix.system.fcntl(sock, posix.F.SETFL, flags | posix.SOCK.NONBLOCK) catch return;
     }
 
     pub fn listen(self: *Self) SocketError!void {
