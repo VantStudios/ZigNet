@@ -1,15 +1,16 @@
 const std = @import("std");
-const Socket = @import("../socket/socket.zig").Socket;
-const Logger = @import("../misc/Logger.zig").Logger;
-const Proto = @import("../proto/root.zig");
-const Packets = Proto.Packets;
-const Connection = @import("./Connection.zig").Connection;
 const Thread = std.Thread;
 const Timestamp = std.Io.Timestamp;
 const Duration = std.Io.Duration;
 const Mutex = std.Io.Mutex;
-
 const builtin = @import("builtin");
+
+const Logger = @import("../misc/Logger.zig").Logger;
+const Proto = @import("../proto/root.zig");
+const Packets = Proto.Packets;
+const Socket = @import("../socket/socket.zig").Socket;
+const Connection = @import("./Connection.zig").Connection;
+
 const is_windows = builtin.os.tag == .windows;
 
 const PERFORM_TIME_CHECKS = false;
@@ -89,11 +90,15 @@ pub const Server = struct {
     }
 
     fn tickLoop(self: *Self) void {
-        const tick_interval: Duration = .fromNanoseconds(@divTrunc(std.time.ns_per_s, @as(i96, self.options.tick_rate)));
+        const tick_interval = Duration.fromNanoseconds(
+            @divTrunc(std.time.ns_per_s, @as(i96, self.options.tick_rate)),
+        );
+
         var next_tick_deadline = Timestamp.now(self.io, .awake).addDuration(tick_interval);
 
         while (self.running) {
             waitUntil(self.io, next_tick_deadline);
+
             const tick_start = Timestamp.now(self.io, .awake);
             next_tick_deadline = advanceTickDeadline(next_tick_deadline, tick_start, tick_interval);
 
@@ -124,6 +129,7 @@ pub const Server = struct {
                     if (self.disconnect_callback) |callback| {
                         callback(conn, self.disconnect_context);
                     }
+
                     conn.deinit();
                     self.options.allocator.destroy(conn);
                     // Logger.INFO("Disconnected connection with key: {d}", .{key});
@@ -161,12 +167,15 @@ pub const Server = struct {
 
         while (true) {
             const now = Timestamp.now(io, .awake);
-            const remaining = deadline.subDuration(.fromNanoseconds(now.nanoseconds));
+            const remaining = deadline.subDuration(Duration.fromNanoseconds(now.nanoseconds));
             if (remaining.toMilliseconds() <= 0) return;
 
             const remaining_ns: u64 = @intCast(remaining.nanoseconds);
             if (remaining_ns > coarse_sleep_guard_ns) {
-                io.sleep(.fromNanoseconds(@intCast(remaining_ns - coarse_sleep_guard_ns)), .awake) catch return;
+                io.sleep(
+                    Duration.fromNanoseconds(@intCast(remaining_ns - coarse_sleep_guard_ns)),
+                    .awake,
+                ) catch return;
                 continue;
             }
 
@@ -179,30 +188,35 @@ pub const Server = struct {
     }
 
     pub fn start(self: *Self) !void {
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.io, .awake) else null;
 
         Logger.INFO("Starting server on {s}:{d}", .{ self.options.address, self.options.port });
         self.running = true;
         self.tick_thread = try self.io.concurrent(tickLoop, .{self});
 
-        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(Timestamp.now(self.io, .awake).nanoseconds)));
+        var seed: u64 = undefined;
+        self.io.random(std.mem.asBytes(&seed));
+        var prng = std.Random.DefaultPrng.init(seed);
+
         self.options.advertisement.guid = prng.random().int(i64);
         self.socket.setCallback(packet_callback, self);
-        self.socket.listen() catch |err| {
-            std.debug.print("Error: {any}", .{err});
-            return err;
-        };
+
+        try self.socket.listen();
 
         if (start_time) |s_time| {
-            const end_time = Timestamp.now(self.io, .awake);
-            const elapsed = s_time.durationTo(end_time);
+            const elapsed = s_time.untilNow(self.io, .awake);
             Logger.DEBUG("PERF: server start took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
-    pub fn packet_callback(data: []const u8, from_addr: std.Io.net.IpAddress, context: ?*anyopaque, allocator: std.mem.Allocator) void {
+    pub fn packet_callback(
+        data: []const u8,
+        from_addr: std.Io.net.IpAddress,
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+    ) void {
         const self = @as(*Self, @ptrCast(@alignCast(context)));
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.io, .awake) else null;
 
         defer allocator.free(data);
 
@@ -214,17 +228,20 @@ pub const Server = struct {
             Packets.UnconnectedPing => {
                 const string = self.options.advertisement.toString(self.options.allocator);
                 defer self.options.allocator.free(string);
+
                 var pong = Proto.UnconnectedPong.init(
                     Timestamp.now(self.io, .real).toMilliseconds(),
                     self.options.advertisement.guid,
                     string,
                     self.options.allocator,
                 );
+
                 defer pong.deinit(allocator);
                 const pong_data = pong.serialize() catch |err| {
                     Logger.ERROR("Failed to serialize unconnected pong: {s}", .{@errorName(err)});
                     return;
                 };
+
                 self.send(pong_data, from_addr);
             },
             Packets.OpenConnectionRequest1 => {
@@ -234,11 +251,14 @@ pub const Server = struct {
                     self.options.max_mtu,
                     self.options.allocator,
                 );
+
                 defer reply.deinit();
+
                 const reply_data = reply.serialize() catch |err| {
                     Logger.ERROR("Failed to serialize connection reply 1: {s}", .{@errorName(err)});
                     return;
                 };
+
                 self.send(reply_data, from_addr);
             },
             Packets.OpenConnectionRequest2 => {
@@ -246,6 +266,7 @@ pub const Server = struct {
                     Logger.ERROR("Failed to deserialize connection request 2: {s}", .{@errorName(err)});
                     return;
                 };
+
                 defer request.deinit(allocator);
 
                 const mtu = @min(request.mtu_size, self.options.max_mtu);
@@ -258,7 +279,9 @@ pub const Server = struct {
                     false,
                     self.options.allocator,
                 );
+
                 defer reply.deinit(allocator);
+
                 const reply_data = reply.serialize(self.options.allocator) catch |err| {
                     Logger.ERROR("Failed to serialize connection reply 2: {s}", .{@errorName(err)});
                     return;
@@ -270,16 +293,17 @@ pub const Server = struct {
                     Logger.WARN("mutex lock failed: {}", .{err});
                     return;
                 };
+
                 defer self.connections_mutex.unlock(self.io);
 
                 if (self.connections.contains(key)) {
                     Logger.INFO("Connection already exists", .{});
                 } else {
-                    // Logger.INFO("New connection", .{});
                     const conn = self.options.allocator.create(Connection) catch |err| {
                         Logger.ERROR("Failed to allocate connection: {s}", .{@errorName(err)});
                         return;
                     };
+
                     conn.* = Connection.init(self, from_addr, mtu, request.guid) catch |err| {
                         Logger.ERROR("Failed to create connection: {s}", .{@errorName(err)});
                         self.options.allocator.destroy(conn);
@@ -299,6 +323,7 @@ pub const Server = struct {
                     Logger.WARN("mutex lock failed: {}", .{err});
                     return;
                 };
+
                 defer self.connections_mutex.unlock(self.io);
 
                 if (self.connections.get(key)) |conn| {
@@ -314,6 +339,7 @@ pub const Server = struct {
                     Logger.WARN("mutex lock failed: {}", .{err});
                     return;
                 };
+
                 defer self.connections_mutex.unlock(self.io);
 
                 if (self.connections.get(key)) |conn| {
@@ -329,6 +355,7 @@ pub const Server = struct {
                     Logger.WARN("mutex lock failed: {}", .{err});
                     return;
                 };
+
                 defer self.connections_mutex.unlock(self.io);
 
                 if (self.connections.get(key)) |conn| {
@@ -344,6 +371,7 @@ pub const Server = struct {
                     Logger.WARN("mutex lock failed: {}", .{err});
                     return;
                 };
+
                 defer self.connections_mutex.unlock(self.io);
 
                 Logger.WARN("Unknown ID {d}", .{ID});
@@ -354,28 +382,27 @@ pub const Server = struct {
         }
 
         if (start_time) |s_time| {
-            const end_time = Timestamp.now(self.io, .awake);
-            const elapsed = s_time.durationTo(end_time);
+            const elapsed = s_time.untilNow(self.io, .awake);
             Logger.DEBUG("PERF: packet_callback took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn send(self: *Self, data: []const u8, to_addr: std.Io.net.IpAddress) void {
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.io, .awake) else null;
+
         self.socket.send(data, to_addr) catch |err| {
             Logger.ERROR("Failed to send: {s}", .{@errorName(err)});
             return;
         };
 
         if (start_time) |s_start| {
-            const end_time = Timestamp.now(self.io, .awake);
-            const elapsed = s_start.durationTo(end_time);
+            const elapsed = s_start.untilNow(self.io, .awake);
             Logger.DEBUG("PERF: send took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn disconnect(self: *Self, address: std.Io.net.IpAddress) void {
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.io, .awake) else null;
 
         const key = addressToKey(address);
         Logger.INFO("Disconnecting connection with key: {d}", .{key});
@@ -384,11 +411,14 @@ pub const Server = struct {
             Logger.WARN("mutex lock failed: {}", .{err});
             return;
         };
+
         defer self.connections_mutex.unlock(self.io);
 
         if (self.connections.fetchRemove(key)) |entry| {
             var conn = entry.value;
+
             conn.deinit();
+
             self.options.allocator.destroy(conn);
             Logger.DEBUG("Connection disconnected successfully: {d}", .{key});
         } else {
@@ -396,8 +426,7 @@ pub const Server = struct {
         }
 
         if (start_time) |s_time| {
-            const end_time = Timestamp.now(self.io, .awake);
-            const elapsed = s_time.durationTo(end_time);
+            const elapsed = s_time.untilNow(self.io, .awake);
             Logger.DEBUG("PERF: disconnect took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
@@ -427,6 +456,7 @@ pub const Server = struct {
             Logger.WARN("mutex lock failed: {}", .{err});
             return null;
         };
+
         defer self.connections_mutex.unlock(self.io);
 
         return self.connections.get(key);
@@ -434,12 +464,13 @@ pub const Server = struct {
 
     /// Get all active connections (returns a copy for thread safety)
     pub fn getActiveConnections(self: *Self, allocator: std.mem.Allocator) !std.ArrayList(*Connection) {
-        var active_connections = std.ArrayList(*Connection).initBuffer(&[_]*Connection{});
+        var active_connections = std.ArrayList(*Connection).empty;
 
         self.connections_mutex.lock(self.io) catch |err| {
             Logger.WARN("mutex lock failed: {}", .{err});
             return err;
         };
+
         defer self.connections_mutex.unlock(self.io);
 
         var iterator = self.connections.valueIterator();
@@ -453,7 +484,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.io, .awake) else null;
 
         self.running = false;
 
@@ -464,6 +495,7 @@ pub const Server = struct {
         if (self.tick_thread) |thread| {
             var feature = thread;
             _ = feature.cancel(self.io);
+
             self.tick_thread = null;
         }
 
@@ -488,8 +520,7 @@ pub const Server = struct {
         self.socket.deinit();
 
         if (start_time) |s_time| {
-            const end_time = Timestamp.now(self.io, .awake);
-            const elapsed = s_time.durationTo(end_time);
+            const elapsed = s_time.untilNow(self.io, .awake);
             Logger.DEBUG("PERF: deinit took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
@@ -569,6 +600,7 @@ test "advanceTickDeadline keeps fixed cadence after a late wake" {
     const tick_interval: Duration = .fromNanoseconds(50_000_000);
     const previous_deadline: Timestamp = .fromNanoseconds(1_000_000_000);
     const late_tick_start: Timestamp = previous_deadline.addDuration(.fromNanoseconds(12_000_000));
+
     try std.testing.expectEqual(
         previous_deadline.addDuration(tick_interval),
         Server.advanceTickDeadline(previous_deadline, late_tick_start, tick_interval),
@@ -579,6 +611,7 @@ test "advanceTickDeadline skips missed intervals when badly behind" {
     const tick_interval: Duration = .fromNanoseconds(50_000_000);
     const previous_deadline: Timestamp = .fromNanoseconds(1_000_000_000);
     const late_tick_start: Timestamp = previous_deadline.addDuration(.fromNanoseconds(125_000_000));
+
     try std.testing.expectEqual(
         previous_deadline.addDuration(.fromNanoseconds(3 * 50_000_000)),
         Server.advanceTickDeadline(previous_deadline, late_tick_start, tick_interval),

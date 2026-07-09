@@ -1,10 +1,12 @@
 const std = @import("std");
-const Server = @import("./Server.zig").Server;
+const Timestamp = std.Io.Timestamp;
+
+const Logger = @import("../misc/Logger.zig").Logger;
 const Proto = @import("../proto/root.zig");
 const Frame = Proto.Frame;
 const Reliability = Proto.Reliability;
-const Timestamp = std.Io.Timestamp;
-const Logger = @import("../misc/Logger.zig").Logger;
+const Server = @import("./Server.zig").Server;
+
 const MAX_ACTIVE_FRAGMENTATIONS = 32;
 const MAX_ORDERING_QUEUE_SIZE = 64;
 
@@ -26,8 +28,8 @@ pub const Connection = struct {
     comm_data: CommData,
     last_receive: Timestamp,
     created_at: Timestamp,
-    game_packet_callback: ?GamePacketCallback,
-    game_packet_context: ?*anyopaque,
+    game_packet_callback: ?GamePacketCallback = null,
+    game_packet_context: ?*anyopaque = null,
     tickCounter: u64 = 0,
     last_ping_time: std.Io.Timestamp = .zero,
     ping_interval: std.Io.Duration = .fromMilliseconds(5000),
@@ -36,9 +38,11 @@ pub const Connection = struct {
     pub fn init(server: *Server, address: std.Io.net.IpAddress, mtu_size: u16, guid: i64) !Self {
         var input_ordering_queue = std.AutoHashMap(u32, std.AutoHashMap(u32, Frame)).init(server.options.allocator);
         var i: u32 = 0;
+
         while (i < MAX_ACTIVE_FRAGMENTATIONS) : (i += 1) {
             try input_ordering_queue.put(i, std.AutoHashMap(u32, Frame).init(server.options.allocator));
         }
+
         return Self{
             .server = server,
             .address = address,
@@ -64,27 +68,24 @@ pub const Connection = struct {
             },
             .last_receive = Timestamp.now(server.io, .awake),
             .created_at = Timestamp.now(server.io, .awake),
-            .game_packet_callback = null,
-            .game_packet_context = null,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // _ = self;
         self.comm_data.deinit(self.server.options.allocator);
     }
 
     pub fn handlePacket(self: *Self, payload: []const u8) !void {
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
         const ID = payload[0];
-        // Logger.INFO("Received Packet {d}", .{ID});
+
         const allocator = self.server.options.allocator;
 
-        // TODO! ConnectedPing / Pong
         switch (ID) {
             Proto.Packets.ConnectionRequest => {
                 var request = try Proto.ConnectionRequest.deserialize(payload, allocator);
                 defer request.deinit();
+
                 const empty_address = Proto.Address.init(4, "0.0.0.0", 0);
                 var accepted = Proto.ConnectionRequestAccepted.init(
                     empty_address,
@@ -94,16 +95,21 @@ pub const Connection = struct {
                     Timestamp.now(self.server.io, .real).toMilliseconds(),
                     allocator,
                 );
+
                 defer accepted.deinit(allocator);
+
                 const serialized = try accepted.serialize(allocator);
                 const frame = frameIn(serialized, allocator);
+
                 self.sendFrame(frame, .Immediate);
             },
             Proto.Packets.NewIncomingConnection => {
                 self.connected = true;
-                const elapsed = self.created_at.durationTo(.now(self.server.io, .awake));
+                const elapsed = self.created_at.untilNow(self.server.io, .awake);
+
                 if (DEBUG)
                     Logger.DEBUG("Connection established in {d}ms", .{elapsed.toMilliseconds()});
+
                 // Trigger server connect callback
                 if (self.server.connect_callback) |callback| {
                     callback(self, self.server.connect_context);
@@ -126,7 +132,9 @@ pub const Connection = struct {
                     Logger.ERROR("Failed to deserialize ConnectedPing: {any}", .{err});
                     return;
                 };
+
                 defer ping.deinit();
+
                 const current_time_ms = Timestamp.now(self.server.io, .real).toMilliseconds();
                 var pong = Proto.ConnectedPong.init(ping.timestamp, current_time_ms, allocator);
                 defer pong.deinit();
@@ -138,6 +146,7 @@ pub const Connection = struct {
 
                 const frame = frameIn(serialized, allocator);
                 self.sendFrame(frame, .Immediate);
+
                 if (DEBUG)
                     Logger.DEBUG("Responded to ConnectedPing with ConnectedPong", .{});
             },
@@ -146,9 +155,12 @@ pub const Connection = struct {
                     Logger.ERROR("Failed to deserialize ConnectedPong: {any}", .{err});
                     return;
                 };
+
                 defer pong.deinit();
+
                 const current_time_ms = Timestamp.now(self.server.io, .real).toMilliseconds();
                 const rtt = current_time_ms - pong.timestamp; // Round trip time
+
                 if (DEBUG)
                     Logger.DEBUG("Received ConnectedPong - RTT: {d}ms", .{rtt});
             },
@@ -157,16 +169,16 @@ pub const Connection = struct {
             },
         }
         if (start_time) |start| {
-            const end_time = Timestamp.now(self.server.io, .awake);
-            const elapsed = start.durationTo(end_time);
+            const elapsed = start.untilNow(self.io, .awake);
             Logger.DEBUG("PERF: handlePacket took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn tick(self: *Connection) void {
         if (!self.active) return;
+
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
-        const elapsed = self.last_receive.durationTo(.now(self.server.io, .awake));
+        const elapsed = self.last_receive.untilNow(self.server.io, .awake);
 
         if (elapsed.toMilliseconds() > 15000) {
             Logger.WARN("info ms {d}", .{elapsed.toMilliseconds()});
@@ -179,6 +191,7 @@ pub const Connection = struct {
 
         const MAX_FRAMES_PER_TICK: usize = 128;
         var frames_sent_this_tick: usize = 0;
+
         self.send_mutex.lock(self.server.io) catch |err| {
             Logger.WARN("mutex lock failed: {}", .{err});
             return;
@@ -187,20 +200,28 @@ pub const Connection = struct {
         while (self.comm_data.output_frame_queue.items.len > 0 and frames_sent_this_tick < MAX_FRAMES_PER_TICK) {
             const before_len = self.comm_data.output_frame_queue.items.len;
             const batch = @min(MAX_FRAMES_PER_TICK - frames_sent_this_tick, before_len);
+
             self.sendQueue(batch);
+
             if (self.comm_data.output_frame_queue.items.len >= before_len) break;
             frames_sent_this_tick += before_len - self.comm_data.output_frame_queue.items.len;
         }
+
         self.send_mutex.unlock(self.server.io);
+
         if (self.comm_data.received_sequences.count() > 0) {
-            var sequences_list = std.ArrayList(u32).initBuffer(&[_]u32{});
+            var sequences_list = std.ArrayList(u32).empty;
             defer sequences_list.deinit(allocator);
+
             var iter = self.comm_data.received_sequences.keyIterator();
             while (iter.next()) |key| {
                 sequences_list.append(allocator, key.*) catch continue;
             }
+
             self.comm_data.received_sequences.clearRetainingCapacity();
+
             if (sequences_list.items.len == 0) return; // Should not really happen.
+
             var ack = Proto.Ack.init(sequences_list.items, allocator) catch return;
             defer ack.deinit();
 
@@ -208,28 +229,36 @@ pub const Connection = struct {
 
             const serialized = try ack.serialize(allocator);
             defer allocator.free(serialized);
+
             self.send(serialized);
         }
         if (self.comm_data.lost_sequences.count() > 0) {
-            var sequences_list = std.ArrayList(u32).initBuffer(&[_]u32{});
+            var sequences_list = std.ArrayList(u32).empty;
             defer sequences_list.deinit(allocator);
+
             var iter = self.comm_data.lost_sequences.keyIterator();
             while (iter.next()) |key| {
                 sequences_list.append(allocator, key.*) catch continue;
             }
+
             self.comm_data.lost_sequences.clearRetainingCapacity();
             if (sequences_list.items.len == 0) return;
+
             var nack = Proto.Ack.init(sequences_list.items, allocator) catch return;
             defer nack.deinit();
             // Logger.DEBUG("> Sending nacks with size {d}", .{sequences_list.items.len});
+
             const serialized = try nack.serialize(allocator);
             defer allocator.free(serialized);
+
             var mutable_serialized = allocator.dupe(u8, serialized) catch |err| {
                 Logger.ERROR("Failed to allocate memory for nack packet: {any}", .{err});
                 return;
             };
+
             defer allocator.free(mutable_serialized);
             mutable_serialized[0] = Proto.Packets.Nack;
+
             self.send(mutable_serialized);
         }
 
@@ -239,6 +268,7 @@ pub const Connection = struct {
         if (self.connected) {
             const current_time = std.Io.Timestamp.now(self.server.io, .awake);
             const since_last_ping = self.last_ping_time.durationTo(current_time);
+
             if (since_last_ping.nanoseconds >= self.ping_interval.nanoseconds) {
                 self.sendPing();
                 self.last_ping_time = current_time;
@@ -248,59 +278,60 @@ pub const Connection = struct {
         self.tickCounter += 1;
 
         if (start_time) |start| {
-            const end_time = Timestamp.now(self.server.io, .awake);
-            const tick_elapsed = start.durationTo(end_time);
+            const tick_elapsed = start.untilNow(self.server.io, .awake);
             Logger.DEBUG("PERF: tick took {d} ms", .{tick_elapsed.toMilliseconds()});
         }
     }
 
     pub fn handleAck(self: *Self, payload: []const u8) !void {
         if (!self.active) return;
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
+
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         var ack = try Proto.Ack.deserialize(payload, self.server.options.allocator);
         defer ack.deinit();
 
         for (ack.sequences) |seq| {
-            if (self.comm_data.output_backup.contains(@as(u24, @intCast(seq)))) {
-                if (self.comm_data.output_backup.get(@as(u24, @intCast(seq)))) |iframes| {
-                    for (iframes) |*frame| {
-                        defer frame.deinit(self.server.options.allocator);
-                    }
-                    self.server.options.allocator.free(iframes);
-                    _ = self.comm_data.output_backup.remove(@as(u24, @intCast(seq)));
+            const key = @as(u24, @intCast(seq));
+            if (self.comm_data.output_backup.get(key)) |iframes| {
+                for (iframes) |*frame| {
+                    defer frame.deinit(self.server.options.allocator);
                 }
+                self.server.options.allocator.free(iframes);
+                _ = self.comm_data.output_backup.remove(key);
             }
         }
 
         if (start_time) |start| {
-            const end_time = Timestamp.now(self.server.io, .awake);
-            const elapsed = start.durationTo(end_time);
+            const elapsed = start.untilNow(self.server.io, .awake);
             Logger.DEBUG("PERF: handleAck took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn handleNack(self: *Self, payload: []const u8) !void {
         if (!self.active) return;
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
+
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         // Ack and Nack are same just different ids we do not check ids when deserializing so we can do this! :D
         var nack = try Proto.Ack.deserialize(payload, self.server.options.allocator);
         defer nack.deinit();
 
         for (nack.sequences) |seq| {
-            const frames = self.comm_data.output_backup.get(@as(u24, @intCast(seq)));
-            if (frames) |f| {
-                var frameset = Proto.FrameSet.init(@as(u24, @intCast(seq)), f, self.server.options.allocator);
+            const key = @as(u24, @intCast(seq));
+
+            if (self.comm_data.output_backup.get(key)) |frame| {
+                var frameset = Proto.FrameSet.init(key, frame, self.server.options.allocator);
                 const serialized = frameset.serialize() catch continue;
+
                 self.send(serialized);
+
                 frameset.deinit(self.server.options.allocator);
             }
         }
 
         if (start_time) |start| {
-            const end_time = Timestamp.now(self.server.io, .awake);
-            const elapsed = start.durationTo(end_time);
+            const elapsed = start.untilNow(self.server.io, .awake);
             Logger.DEBUG("PERF: handleNack took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
@@ -317,16 +348,20 @@ pub const Connection = struct {
         const sequence = frameSet.sequence_number;
         // Logger.DEBUG("Frameset {d}", .{frameSet.sequence_number});
 
-        const is_duplicate = (self.comm_data.last_input_sequence != -1 and sequence <= @as(u24, @intCast(@max(0, self.comm_data.last_input_sequence)))) or self.comm_data.received_sequences.contains(sequence);
-        // Logger.DEBUG("Frameset Duplicate? {}", .{is_duplicate});
-        if (is_duplicate) {
+        const last = self.comm_data.last_input_sequence;
+        const is_older_than_last = last != -1 and sequence <= @as(u24, @intCast(@max(0, last)));
+        const is_already_received = self.comm_data.received_sequences.contains(sequence);
+
+        if (is_older_than_last or is_already_received) {
             return;
         }
 
         self.comm_data.received_sequences.put(sequence, {}) catch {
             return;
         };
+
         _ = self.comm_data.lost_sequences.remove(sequence);
+
         const last_seq = @as(u24, @intCast(@max(0, self.comm_data.last_input_sequence)));
         if (sequence > last_seq + 1) {
             var i: u24 = last_seq + 1;
@@ -334,21 +369,22 @@ pub const Connection = struct {
                 self.comm_data.lost_sequences.put(i, {}) catch {};
             }
         }
+
         self.comm_data.last_input_sequence = @as(i32, @intCast(sequence));
         for (frameSet.frames) |frame| {
             try self.handleFrame(frame);
         }
 
         if (start_time) |s_time| {
-            const end_time = Timestamp.now(self.server.io, .awake);
-            const elapsed = s_time.durationTo(end_time);
+            const elapsed = s_time.untilNow(self.server.io, .awake);
             Logger.DEBUG("PERF: onFrameSet took {d} ms", .{elapsed.toMicroseconds()});
         }
     }
 
     pub fn handleFrame(self: *Connection, frame: Frame) !void {
         if (!self.active) return;
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
+
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         if (frame.payload.len == 0) {
             Logger.WARN("Frame has empty payload - skipping in handleFrame", .{});
@@ -369,22 +405,24 @@ pub const Connection = struct {
         }
 
         if (start_time) |start| {
-            const end_time = Timestamp.now(self.server.io, .awake);
-            const elapsed = start.durationTo(end_time);
-            Logger.DEBUG("PERF: handleFrame took {d} ms", .{elapsed.toMilliseconds()});
+            const elapsed = start.untilNow(self.server.io, .awake);
+            .Logger.DEBUG("PERF: handleFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn handleOrderedFrame(self: *Connection, frame: Frame) void {
         if (!self.active) return;
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
+
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         if (DEBUG)
             Logger.DEBUG("Ordered Frame!", .{});
+
         const channel = frame.order_channel orelse {
             Logger.ERROR("Ordered frame missing order_channel", .{});
             return;
         };
+
         const frame_index = frame.ordered_frame_index orelse {
             Logger.ERROR("Ordered frame missing ordered_frame_index", .{});
             return;
@@ -393,19 +431,24 @@ pub const Connection = struct {
         if (frame.ordered_frame_index == self.comm_data.input_order_index[channel]) {
             self.comm_data.input_highest_sequence_index[channel] = @as(u32, @intCast(0));
             self.comm_data.input_order_index[channel] = frame_index + 1;
+
             self.handlePacket(frame.payload) catch {
                 Logger.ERROR("Failed to handle packet", .{});
                 return;
             };
+
             var index = self.comm_data.input_order_index[channel];
             var outOfOrderQueue = self.comm_data.input_ordering_queue.getPtr(channel);
+
             if (outOfOrderQueue == null) {
                 Logger.ERROR("OutOfOrderQueue is null", .{});
                 return;
             }
+
             while (outOfOrderQueue.?.contains(index)) : (index += 1) {
                 const iframe = outOfOrderQueue.?.get(index);
                 if (iframe == null) break;
+
                 if (iframe) |iiframe| {
                     self.handlePacket(iiframe.payload) catch |err| {
                         Logger.ERROR("Failed to handle packet: {any}", .{err});
@@ -417,6 +460,7 @@ pub const Connection = struct {
                 }
                 _ = outOfOrderQueue.?.remove(index);
             }
+
             self.comm_data.input_order_index[channel] = index;
         } else if (frame_index > self.comm_data.input_order_index[channel]) {
             const unordered = self.comm_data.input_ordering_queue.getPtr(channel);
@@ -426,9 +470,11 @@ pub const Connection = struct {
                     Logger.ERROR("Failed to dupe payload for ordering queue", .{});
                     return;
                 };
+
                 var frame_copy = frame;
                 frame_copy.payload = payload_copy;
                 frame_copy.allocator = allocator;
+
                 map.put(frame_index, frame_copy) catch |err| {
                     Logger.ERROR("Failed to put frame in ordering queue: {any}", .{err});
                     allocator.free(payload_copy);
@@ -443,28 +489,30 @@ pub const Connection = struct {
         }
 
         if (start_time) |start| {
-            const end_time = Timestamp.now(self.server.io, .awake);
-            const elapsed = start.durationTo(end_time);
-            Logger.DEBUG("PERF: handleOrderedFrame took {d} ms", .{elapsed.toMilliseconds()});
+            const elapsed = start.untilNow(self.server.io, .awake);
+            .Logger.DEBUG("PERF: handleOrderedFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn handleSequencedFrame(self: *Self, frame: Frame) void {
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         const channel = frame.order_channel orelse 0;
         if (channel >= MAX_ACTIVE_FRAGMENTATIONS) {
             Logger.ERROR("Invalid channel: {d}", .{channel});
             return;
         }
+
         const frame_index = frame.sequence_frame_index orelse {
             Logger.ERROR("Sequenced frame missing sequence_frame_index", .{});
             return;
         };
+
         const order_index = frame.ordered_frame_index orelse {
             Logger.ERROR("Sequenced frame missing ordered_frame_index", .{});
             return;
         };
+
         const current_highest = self.comm_data.input_highest_sequence_index[channel];
         if (frame_index >= current_highest and order_index >= self.comm_data.input_order_index[channel]) {
             self.comm_data.input_highest_sequence_index[channel] = frame_index + 1;
@@ -476,8 +524,7 @@ pub const Connection = struct {
         }
 
         if (start_time) |start| {
-            const end_time = Timestamp.now(self.server.io, .awake);
-            const elapsed = start.durationTo(end_time);
+            const elapsed = start.untilNow(self.server.io, .awake);
             Logger.DEBUG("PERF: handleSequencedFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
@@ -513,7 +560,19 @@ pub const Connection = struct {
                 Logger.ERROR("Failed to duplicate frame payload", .{});
                 return;
             };
-            const frame_copy = Frame.init(frame.reliable_frame_index, frame.sequence_frame_index, frame.ordered_frame_index, frame.order_channel, frame.reliability, payload_copy, frame.split_frame_index, frame.split_id, frame.split_size, allocator);
+
+            const frame_copy = Frame.init(
+                frame.reliable_frame_index,
+                frame.sequence_frame_index,
+                frame.ordered_frame_index,
+                frame.order_channel,
+                frame.reliability,
+                payload_copy,
+                frame.split_frame_index,
+                frame.split_id,
+                frame.split_size,
+                allocator,
+            );
 
             // Set the split frame to the fragment
             fragment.put(@as(u16, @intCast(split_index)), frame_copy) catch {
@@ -535,6 +594,7 @@ pub const Connection = struct {
                         Logger.ERROR("Missing fragment at index {d}", .{index});
                         return;
                     };
+
                     // Write the payload to the stream
                     try stream.write(sframe.payload);
                 }
@@ -546,16 +606,25 @@ pub const Connection = struct {
                 };
 
                 // Construct the new frame with values from the original frame
-                const nframe = Frame.init(frame.reliable_frame_index, frame.sequence_frame_index, frame.ordered_frame_index, frame.order_channel, frame.reliability, reconstructed_payload, null, // split_frame_index - not split anymore
+                const nframe = Frame.init(
+                    frame.reliable_frame_index,
+                    frame.sequence_frame_index,
+                    frame.ordered_frame_index,
+                    frame.order_channel,
+                    frame.reliability,
+                    reconstructed_payload,
+                    null, // split_frame_index - not split anymore
                     null, // split_id - not split anymore
                     null, // split_size - not split anymore
-                    allocator);
+                    allocator,
+                );
 
                 // Clean up the fragments before removing from queue
                 var frag_iter = fragment.iterator();
                 while (frag_iter.next()) |entry| {
                     entry.value_ptr.deinit(allocator);
                 }
+
                 fragment.deinit();
 
                 // Delete the fragment id from the queue
@@ -584,7 +653,18 @@ pub const Connection = struct {
                 Logger.ERROR("Failed to duplicate frame payload", .{});
                 return;
             };
-            const frame_copy = Frame.init(frame.reliable_frame_index, frame.sequence_frame_index, frame.ordered_frame_index, frame.order_channel, frame.reliability, payload_copy, frame.split_frame_index, frame.split_id, frame.split_size, allocator);
+            const frame_copy = Frame.init(
+                frame.reliable_frame_index,
+                frame.sequence_frame_index,
+                frame.ordered_frame_index,
+                frame.order_channel,
+                frame.reliability,
+                payload_copy,
+                frame.split_frame_index,
+                frame.split_id,
+                frame.split_size,
+                allocator,
+            );
 
             new_fragment.put(@as(u16, @intCast(split_index)), frame_copy) catch {
                 Logger.ERROR("Failed to create new fragment queue", .{});
@@ -609,6 +689,7 @@ pub const Connection = struct {
             Logger.ERROR("Failed to duplicate payload: {any}", .{err});
             return Frame.init(null, null, null, 0, Reliability.ReliableOrdered, &[_]u8{}, null, null, null, allocator);
         };
+
         return Frame.init(null, null, null, 0, Reliability.ReliableOrdered, payload_copy, null, null, null, allocator);
     }
 
@@ -618,6 +699,7 @@ pub const Connection = struct {
 
         var frame = frameIn(msg, self.server.options.allocator);
         frame.reliability = Reliability.ReliableOrdered;
+
         self.sendFrame(frame, priority);
     }
 
@@ -632,9 +714,10 @@ pub const Connection = struct {
             Logger.WARN("mutex lock failed: {}", .{err});
             return;
         };
+
         defer self.send_mutex.unlock(self.server.io);
 
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         const channel_index = frame.order_channel orelse 0;
         const channel = @as(usize, channel_index);
@@ -643,15 +726,18 @@ pub const Connection = struct {
         if (mutable_frame.isSequenced()) {
             mutable_frame.ordered_frame_index = self.comm_data.output_order_index[channel];
             mutable_frame.sequence_frame_index = self.comm_data.output_sequence_index[channel];
+
             self.comm_data.output_sequence_index[channel] += 1;
         } else if (mutable_frame.isOrdered()) {
             mutable_frame.ordered_frame_index = self.comm_data.output_order_index[channel];
+
             self.comm_data.output_order_index[channel] += 1;
             self.comm_data.output_sequence_index[channel] = 0;
         }
 
         const payload_size = mutable_frame.payload.len;
         const max_size = self.mtu_size - 36;
+
         if (payload_size <= max_size) {
             if (mutable_frame.isReliable()) {
                 mutable_frame.reliable_frame_index = self.comm_data.output_reliable_index;
@@ -660,16 +746,14 @@ pub const Connection = struct {
             self.queueFrame(mutable_frame, priority);
 
             if (start_time) |start| {
-                const end_time = Timestamp.now(self.server.io, .awake);
-                const elapsed = start.durationTo(end_time);
+                const elapsed = start.untilNow(self.server.io, .awake);
                 Logger.DEBUG("PERF: sendFrame took {d} ms", .{elapsed.toMilliseconds()});
             }
 
             return;
         } else {
             if (start_time) |start| {
-                const end_time = Timestamp.now(self.server.io, .awake);
-                const elapsed = start.durationTo(end_time);
+                const elapsed = start.untilNow(self.server.io, .awake);
                 Logger.DEBUG("PERF: sendFrame (large payload path) took {d} ms", .{elapsed.toMilliseconds()});
             }
 
@@ -678,9 +762,16 @@ pub const Connection = struct {
         }
     }
 
-    pub fn handleLargePayload(self: *Connection, frame: *Frame, max_size: usize, split_size: usize, priority: Priority) void {
+    pub fn handleLargePayload(
+        self: *Connection,
+        frame: *Frame,
+        max_size: usize,
+        split_size: usize,
+        priority: Priority,
+    ) void {
         const allocator = self.server.options.allocator;
         const split_id = self.comm_data.output_split_index;
+
         self.comm_data.output_split_index = (self.comm_data.output_split_index +% 1);
 
         // Store original payload reference before we start fragmenting
@@ -718,7 +809,7 @@ pub const Connection = struct {
     }
 
     pub fn queueFrame(self: *Connection, frame: Frame, priority: Priority) void {
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         // Don't queue frames if connection is not active - prevents leaks during shutdown
         if (!self.active) {
@@ -739,14 +830,13 @@ pub const Connection = struct {
         }
 
         if (start_time) |start| {
-            const end_time = Timestamp.now(self.server.io, .awake);
-            const elapsed = start.durationTo(end_time);
+            const elapsed = start.untilNow(self.server.io, .awake);
             Logger.DEBUG("PERF: queueFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
     pub fn sendQueue(self: *Connection, amount: usize) void {
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         if (self.comm_data.output_frame_queue.items.len == 0) return;
         const allocator = self.server.options.allocator;
@@ -795,13 +885,16 @@ pub const Connection = struct {
                     for (0..i) |j| {
                         backup[j].deinit(allocator);
                     }
+
                     allocator.free(backup);
                     self.cleanupOutputQueueFrames(count);
+
                     Logger.ERROR("Payload dupe failed at frame {any}", .{i});
                     return;
                 }
             else
                 &[_]u8{};
+
             backup[i] = Frame.init(frame.reliable_frame_index, frame.sequence_frame_index, frame.ordered_frame_index, frame.order_channel, frame.reliability, payload, frame.split_frame_index, frame.split_id, frame.split_size, allocator);
         }
 
@@ -815,14 +908,12 @@ pub const Connection = struct {
             return;
         };
 
-        if (self.comm_data.output_backup.contains(sequence)) {
-            if (self.comm_data.output_backup.get(sequence)) |iframes| {
-                for (iframes) |*frame| {
-                    defer frame.deinit(allocator);
-                }
-                allocator.free(iframes);
-                _ = self.comm_data.output_backup.remove(sequence);
+        if (self.comm_data.output_backup.get(sequence)) |iframes| {
+            for (iframes) |*frame| {
+                defer frame.deinit(allocator);
             }
+            allocator.free(iframes);
+            _ = self.comm_data.output_backup.remove(sequence);
         }
 
         self.comm_data.output_backup.put(sequence, backup) catch |err| {
@@ -847,10 +938,13 @@ pub const Connection = struct {
     fn cleanupOutputQueueFrames(self: *Connection, amount: usize) void {
         const queue = &self.comm_data.output_frame_queue;
         const to_remove = @min(amount, queue.items.len);
+
         if (to_remove == 0) return;
+
         for (queue.items[0..to_remove]) |*frame| {
             frame.deinit(self.server.options.allocator);
         }
+
         queue.replaceRange(self.server.options.allocator, 0, to_remove, &[_]Frame{}) catch |err| {
             Logger.ERROR("Failed to cleanup output queue frames: {any}", .{err});
             return;
@@ -858,12 +952,11 @@ pub const Connection = struct {
     }
 
     pub fn send(self: *Connection, data: []const u8) void {
-        // Logger.INFO("Sending data to {any}", .{self.address});
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) Timestamp.now(self.server.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
+
         self.server.send(data, self.address);
         if (start_time) |start| {
-            const end_time = Timestamp.now(self.server.io, .awake);
-            const elapsed = start.durationTo(end_time);
+            const elapsed = start.untilNow(self.server.io, .awake);
             Logger.DEBUG("PERF: send took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
@@ -932,6 +1025,7 @@ pub const CommData = struct {
         for (self.output_frame_queue.items) |*frame| {
             frame.deinit(allocator);
         }
+
         self.output_frame_queue.clearAndFree(allocator);
         self.output_frame_queue.deinit(allocator);
 
@@ -941,8 +1035,10 @@ pub const CommData = struct {
             while (inner_iterator.next()) |inner_entry| {
                 inner_entry.value_ptr.deinit(allocator);
             }
+
             inner_map.deinit();
         }
+
         self.input_ordering_queue.deinit();
 
         var backup_iter = self.output_backup.iterator();
@@ -951,8 +1047,10 @@ pub const CommData = struct {
             for (frames) |*frame| {
                 frame.deinit(allocator);
             }
+
             allocator.free(frames);
         }
+
         self.output_backup.deinit();
 
         var fragments_iter = self.fragments_queue.iterator();
@@ -961,8 +1059,10 @@ pub const CommData = struct {
             while (inner_fragments_iter.next()) |inner_entry| {
                 inner_entry.value_ptr.deinit(allocator);
             }
+
             outer_entry.value_ptr.deinit();
         }
+
         self.fragments_queue.deinit();
     }
 };

@@ -1,11 +1,14 @@
 const std = @import("std");
+const Timestamp = std.Io.Timestamp;
+const Duration = std.Io.Duration;
+
 const Raknet = @import("Raknet");
 const Server = Raknet.Server;
 const Client = Raknet.Client;
 const Connection = Raknet.Connection;
 const Logger = Raknet.Logger;
 
-const SERVER = true; // true = run server, false = run client
+const SERVER = false; // true = run server, false = run client
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -37,33 +40,34 @@ fn runServer(io: std.Io, allocator: std.mem.Allocator) !void {
     server.setDisconnectCallback(onServerDisconnect, null);
     try server.start();
 
-    try io.sleep(.fromSeconds(30), .awake);
+    try io.sleep(Duration.fromSeconds(30), .awake);
 }
 
-fn runClient(_: std.Io, allocator: std.mem.Allocator) !void {
+fn runClient(io: std.Io, allocator: std.mem.Allocator) !void {
     Logger.INFO("Running ZigNet Client", .{});
     var client = try Client.init(.{
+        .io = io,
         .allocator = allocator,
         .address = "127.0.0.1",
         .port = 19132,
     });
     defer client.deinit();
 
-    connect_start_time = std.time.milliTimestamp();
+    connect_start_time = Timestamp.now(io, .awake);
     client.setConnectionCallback(onClientConnect, null);
     client.setGamePacketCallback(onGamePacket, null);
     client.setDisconnectionCallback(onClientDisconnect, null);
     try client.connect();
 
-    const time_start = std.time.milliTimestamp();
-    while (std.time.milliTimestamp() - time_start < 5000 and client.status != .Disconnected) {
-        std.Thread.sleep(std.time.ns_per_s);
+    const time_start = Timestamp.now(io, .awake);
+    while (time_start.untilNow(io, .awake).toMilliseconds() < 120000 and client.status != .Disconnected) {
+        try io.sleep(Duration.fromNanoseconds(std.time.ns_per_s), .awake);
     }
-    std.Thread.sleep(std.time.ns_per_s);
+    try io.sleep(Duration.fromNanoseconds(std.time.ns_per_s), .awake);
     client.status = .Disconnected;
 }
 
-var connect_start_time: i64 = 0;
+var connect_start_time: std.Io.Timestamp = undefined;
 
 fn onServerConnect(connection: *Connection, context: ?*anyopaque) void {
     _ = context;
@@ -77,7 +81,7 @@ fn onServerDisconnect(connection: *Connection, context: ?*anyopaque) void {
 
 fn onClientConnect(client: *Client, context: ?*anyopaque) void {
     _ = context;
-    const elapsed = std.time.milliTimestamp() - connect_start_time;
+    const elapsed = connect_start_time.untilNow(client.options.io, .awake).toMilliseconds();
     Logger.INFO("Client: Connected in {d}ms", .{elapsed});
     client.setGamePacketCallback(onGamePacket, null);
 }

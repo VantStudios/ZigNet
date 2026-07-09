@@ -1,23 +1,25 @@
 const std = @import("std");
-const Socket = @import("../socket/socket.zig").Socket;
-const Logger = @import("../misc/Logger.zig").Logger;
+const Io = std.Io;
+const Timestamp = Io.Timestamp;
+const Duration = Io.Duration;
 
+const Logger = @import("../misc/Logger.zig").Logger;
 const Address = @import("../proto/Address.zig").Address;
+const OpenConnectionReply1 = @import("../proto/offline/ConnectionReply1.zig").ConnectionReply1;
+const ConnectionReply1Module = @import("../proto/offline/ConnectionReply1.zig");
+const ConnectionReply2 = @import("../proto/offline/ConnectionReply2.zig").ConnectionReply2;
+const OpenConnectionRequest1 = @import("../proto/offline/ConnectionRequest1.zig").ConnectionRequest1;
+const OpenConnectionRequest2 = @import("../proto/offline/ConnectionRequest2.zig").ConnectionRequest2;
+const ConnectedPing = @import("../proto/online/ConnectedPing.zig").ConnectedPing;
+const ConnectedPong = @import("../proto/online/ConnectedPong.zig").ConnectedPong;
+const ConnectionRequest = @import("../proto/online/ConnectionRequest.zig").ConnectionRequest;
+const ConnectionRequestAccepted = @import("../proto/online/ConnectionRequestAccepted.zig").ConnectionRequestAccepted;
+const NewIncomingConnection = @import("../proto/online/NewIncomingConnection.zig").NewIncomingConnection;
+const Packets = @import("../proto/Packets.zig").Packets;
 const Proto = @import("../proto/root.zig");
 const Frame = Proto.Frame;
 const Reliability = Proto.Reliability;
-
-const Packets = @import("../proto/Packets.zig").Packets;
-const OpenConnectionRequest1 = @import("../proto/offline/ConnectionRequest1.zig").ConnectionRequest1;
-const OpenConnectionRequest2 = @import("../proto/offline/ConnectionRequest2.zig").ConnectionRequest2;
-const ConnectionReply2 = @import("../proto/offline/ConnectionReply2.zig").ConnectionReply2;
-const ConnectionRequest = @import("../proto/online/ConnectionRequest.zig").ConnectionRequest;
-const NewIncomingConnection = @import("../proto/online/NewIncomingConnection.zig").NewIncomingConnection;
-const ConnectionRequestAccepted = @import("../proto/online/ConnectionRequestAccepted.zig").ConnectionRequestAccepted;
-const ConnectedPing = @import("../proto/online/ConnectedPing.zig").ConnectedPing;
-const ConnectedPong = @import("../proto/online/ConnectedPong.zig").ConnectedPong;
-const OpenConnectionReply1 = @import("../proto/offline/ConnectionReply1.zig").ConnectionReply1;
-const ConnectionReply1Module = @import("../proto/offline/ConnectionReply1.zig");
+const Socket = @import("../socket/socket.zig").Socket;
 
 const MAX_ACTIVE_FRAGMENTATIONS = 128;
 const MAX_ORDERING_QUEUE_SIZE = 128;
@@ -33,7 +35,7 @@ pub const Client = struct {
     socket: Socket,
     status: Status = .Disconnected,
     comm_data: CommData,
-    last_receive: i64,
+    last_receive: Timestamp,
 
     game_callback: ?GamePacketCallback = null,
     connection_callback: ?ConnectionCallback = null,
@@ -64,7 +66,7 @@ pub const Client = struct {
 
         var self = Client{
             .options = options,
-            .socket = try Socket.init(options.allocator, "0.0.0.0", 0),
+            .socket = try Socket.init(options.io, options.allocator, "0.0.0.0", 0),
             .tick_thread = null,
             .comm_data = .{
                 .received_sequences = std.AutoHashMap(u24, void).init(options.allocator),
@@ -81,10 +83,10 @@ pub const Client = struct {
                 .output_split_index = 0,
                 .fragments_queue = std.AutoHashMap(u16, std.AutoHashMap(u16, Frame)).init(options.allocator),
             },
-            .last_receive = std.time.milliTimestamp(),
+            .last_receive = Timestamp.now(options.io, .awake),
         };
 
-        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(std.time.milliTimestamp())));
+        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(Timestamp.now(options.io, .awake).toMilliseconds())));
         self.options.guid = prng.random().int(i64);
         return self;
     }
@@ -94,7 +96,7 @@ pub const Client = struct {
         self.socket.setCallback(Client._on, self);
         self.status = .Connecting;
         self.connect_called = true;
-        self.last_receive = std.time.milliTimestamp();
+        self.last_receive = Timestamp.now(self.options.io, .awake);
 
         self.tick_thread = try std.Thread.spawn(.{}, tickLoop, .{self});
         var request = OpenConnectionRequest1.init(11, self.options.mtu_size, self.options.allocator);
@@ -120,18 +122,31 @@ pub const Client = struct {
     }
 
     fn tickLoop(self: *Self) void {
-        // std.debug.print("Client tick loop started.\n", .{});
+        const tick_rate = if (self.options.tick_rate > 0) self.options.tick_rate else 20;
+        const ns_per_tick = std.time.ns_per_s / tick_rate;
 
         while (self.status != .Disconnected) {
+            const start_time = Timestamp.now(self.options.io, .awake);
+
             self.tick();
-            std.Thread.sleep(std.time.ns_per_s / self.options.tick_rate);
+
+            const elapsed = start_time.untilNow(self.options.io, .awake).toNanoseconds();
+
+            if (elapsed < ns_per_tick) {
+                const sleep_time = ns_per_tick - elapsed;
+
+                self.options.io.sleep(Duration.fromNanoseconds(sleep_time), .awake) catch |err| {
+                    std.debug.print("Error crítico en el bucle de sleep: {}\n", .{err});
+                    break;
+                };
+            }
         }
     }
 
     pub fn onReceive(
         self: *Client,
         payload: []u8,
-        from_addr: std.net.Address,
+        from_addr: Io.net.IpAddress,
         allocator: std.mem.Allocator,
     ) !void {
         _ = from_addr;
@@ -139,7 +154,7 @@ pub const Client = struct {
         var ID: u8 = payload[0];
         if (ID & 0xF0 == 0x80) ID = 0x80;
 
-        self.last_receive = std.time.milliTimestamp();
+        self.last_receive = Timestamp.now(self.options.io, .awake);
         switch (ID) {
             Packets.OpenConnectionReply1 => {
                 // Only process if we haven't received Reply1 yet
@@ -236,7 +251,7 @@ pub const Client = struct {
 
     pub fn _on(
         payload: []u8,
-        from_addr: std.net.Address,
+        from_addr: Io.net.IpAddress,
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
     ) void {
@@ -249,7 +264,7 @@ pub const Client = struct {
     pub fn onFrameSet(self: *Self, buffer: []const u8) !void {
         if (self.status == .Disconnected) return;
 
-        self.last_receive = std.time.milliTimestamp();
+        self.last_receive = Timestamp.now(self.options.io, .awake);
 
         var frameSet = try Proto.FrameSet.deserialize(buffer, self.options.allocator);
         defer frameSet.deinit(self.options.allocator);
@@ -257,8 +272,11 @@ pub const Client = struct {
         const sequence = frameSet.sequence_number;
 
         {
-            self.comm_data.input_mutex.lock();
-            defer self.comm_data.input_mutex.unlock();
+            self.comm_data.input_mutex.lock(self.options.io) catch |err| {
+                std.debug.print("failed to acquire lock: {}\n", .{err});
+                return;
+            };
+            defer self.comm_data.input_mutex.unlock(self.options.io);
 
             const is_duplicate = (self.comm_data.last_input_sequence != -1 and sequence <= @as(u24, @intCast(@max(0, self.comm_data.last_input_sequence)))) or self.comm_data.received_sequences.contains(sequence);
             if (is_duplicate) {
@@ -534,7 +552,7 @@ pub const Client = struct {
                 var nic = NewIncomingConnection.init(
                     Address.init(4, self.options.address, self.options.port),
                     Address.init(4, "0.0.0.0", 0),
-                    std.time.milliTimestamp(),
+                    Timestamp.now(self.options.io, .awake).toMilliseconds(),
                     pak.timestamp,
                     allocator,
                 );
@@ -552,12 +570,12 @@ pub const Client = struct {
             },
             Proto.Packets.DisconnectNotification => {
                 self.status = .Disconnected;
+
                 if (self.disconnection_callback) |callback| {
                     callback(self, self.disconnection_callback_ctx);
                 } else {
                     std.debug.print("Client disconnected by server\n", .{});
                 }
-                // std.debug.print("Client disconnected by server\n", .{});
             },
             254 => {
                 if (self.game_callback) |callback| {
@@ -565,16 +583,13 @@ pub const Client = struct {
                 } else {
                     std.debug.print("Received game packet (ID 254) but no callback is set\n", .{});
                 }
-
-                // Game packet - could add callback here
-                // std.debug.print("Received game packet (ID 254)\n", .{});
             },
             Packets.ConnectedPing => {
                 var ping = try ConnectedPing.deserialize(payload, self.options.allocator);
                 defer ping.deinit();
                 var pong = ConnectedPong.init(
                     ping.timestamp,
-                    std.time.milliTimestamp(),
+                    Timestamp.now(self.options.io, .awake).toMilliseconds(),
                     self.options.allocator,
                 );
                 defer pong.deinit();
@@ -595,8 +610,8 @@ pub const Client = struct {
         var ack = try Proto.Ack.deserialize(payload, self.options.allocator);
         defer ack.deinit();
 
-        self.comm_data.output_queue_mutex.lock();
-        defer self.comm_data.output_queue_mutex.unlock();
+        try self.comm_data.output_queue_mutex.lock(self.options.io);
+        defer self.comm_data.output_queue_mutex.unlock(self.options.io);
 
         for (ack.sequences) |seq| {
             const key = @as(u24, @intCast(seq));
@@ -613,8 +628,8 @@ pub const Client = struct {
         var nack = try Proto.Ack.deserialize(payload, self.options.allocator);
         defer nack.deinit();
 
-        self.comm_data.output_queue_mutex.lock();
-        defer self.comm_data.output_queue_mutex.unlock();
+        try self.comm_data.output_queue_mutex.lock(self.options.io);
+        defer self.comm_data.output_queue_mutex.unlock(self.options.io);
 
         for (nack.sequences) |seq| {
             const key = @as(u24, @intCast(seq));
@@ -720,8 +735,11 @@ pub const Client = struct {
     }
 
     pub fn queueFrame(self: *Client, frame: Frame, priority: Priority) void {
-        self.comm_data.output_queue_mutex.lock();
-        defer self.comm_data.output_queue_mutex.unlock();
+        self.comm_data.output_queue_mutex.lock(self.options.io) catch |err| {
+            std.debug.print("failed to acquire lock: {}\n", .{err});
+            return;
+        };
+        defer self.comm_data.output_queue_mutex.unlock(self.options.io);
 
         self.comm_data.output_frame_queue.append(self.options.allocator, frame) catch {
             Logger.ERROR("Failed to queue frame", .{});
@@ -738,8 +756,11 @@ pub const Client = struct {
     }
 
     pub fn sendQueue(self: *Client, amount: usize) void {
-        self.comm_data.output_queue_mutex.lock();
-        defer self.comm_data.output_queue_mutex.unlock();
+        self.comm_data.output_queue_mutex.lock(self.options.io) catch |err| {
+            std.debug.print("failed to acquire lock: {}\n", .{err});
+            return;
+        };
+        defer self.comm_data.output_queue_mutex.unlock(self.options.io);
         self.sendQueueLocked(amount);
     }
 
@@ -788,8 +809,11 @@ pub const Client = struct {
     }
 
     fn cleanupOutputQueueFrames(self: *Client, amount: usize) void {
-        self.comm_data.output_queue_mutex.lock();
-        defer self.comm_data.output_queue_mutex.unlock();
+        self.comm_data.output_queue_mutex.lock(self.options.io) catch |err| {
+            std.debug.print("failed to acquire lock: {}\n", .{err});
+            return;
+        };
+        defer self.comm_data.output_queue_mutex.unlock(self.options.io);
         self.cleanupOutputQueueFramesLocked(amount);
     }
 
@@ -811,7 +835,8 @@ pub const Client = struct {
         if (self.status == .Disconnected or !self.connect_called) return;
 
         // Only check for timeout after connect() has been called
-        if (self.connect_called and self.last_receive + 15000 < std.time.milliTimestamp()) {
+        const elapsed = self.last_receive.untilNow(self.options.io, .awake).toMilliseconds();
+        if (self.connect_called and elapsed >= 15000) {
             Logger.WARN("Client has not received any packets in 15000ms (15s)", .{});
             self.status = .Disconnected;
             return;
@@ -820,16 +845,22 @@ pub const Client = struct {
         const allocator = self.options.allocator;
         // Check queue length under lock to avoid race condition
         {
-            self.comm_data.output_queue_mutex.lock();
+            self.comm_data.output_queue_mutex.lock(self.options.io) catch |err| {
+                std.debug.print("failed to acquire lock: {}\n", .{err});
+                return;
+            };
             const queue_len = self.comm_data.output_frame_queue.items.len;
             if (queue_len > 0) {
                 self.sendQueueLocked(queue_len);
             }
-            self.comm_data.output_queue_mutex.unlock();
+            self.comm_data.output_queue_mutex.unlock(self.options.io);
         }
 
-        self.comm_data.input_mutex.lock();
-        defer self.comm_data.input_mutex.unlock();
+        self.comm_data.input_mutex.lock(self.options.io) catch |err| {
+            std.debug.print("failed to acquire lock: {}\n", .{err});
+            return;
+        };
+        defer self.comm_data.input_mutex.unlock(self.options.io);
 
         if (self.comm_data.received_sequences.count() > 0) {
             var sequences_list = std.ArrayList(u32).initBuffer(&[_]u32{});
@@ -876,6 +907,7 @@ pub const Client = struct {
 };
 
 pub const ClientOptions = struct {
+    io: Io,
     allocator: std.mem.Allocator = std.heap.page_allocator,
     address: []const u8 = "127.0.0.1",
     port: u16 = 19132,
@@ -895,7 +927,7 @@ pub const CommData = struct {
     last_input_sequence: i32 = -1,
     received_sequences: std.AutoHashMap(u24, void),
     lost_sequences: std.AutoHashMap(u24, void),
-    input_mutex: std.Thread.Mutex = .{},
+    input_mutex: Io.Mutex = .init,
     input_order_index: [MAX_ACTIVE_FRAGMENTATIONS]u32,
     input_highest_sequence_index: [MAX_ACTIVE_FRAGMENTATIONS]u32,
     input_ordering_queue: std.AutoHashMap(u32, std.AutoHashMap(u32, Frame)),
@@ -903,7 +935,7 @@ pub const CommData = struct {
     output_reliable_index: u32,
     output_sequence: u32,
     output_frame_queue: std.ArrayList(Frame),
-    output_queue_mutex: std.Thread.Mutex = .{},
+    output_queue_mutex: Io.Mutex = .init,
     output_backup: std.AutoHashMap(u24, []u8),
     output_order_index: [MAX_ACTIVE_FRAGMENTATIONS]u32,
     output_sequence_index: [MAX_ACTIVE_FRAGMENTATIONS]u32,

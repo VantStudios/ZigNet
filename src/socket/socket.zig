@@ -208,6 +208,7 @@ pub const Socket = struct {
                     buffer_shortage = true;
                     break;
                 };
+
                 defer self.buffer_pool.release(buffer);
 
                 const result = self.receivePacket(buffer.data[0..]);
@@ -252,7 +253,7 @@ pub const Socket = struct {
             // Adaptive sleep strategy based on system activity
             if (buffer_shortage) {
                 // Sleep briefly to let buffers free up
-                self.io.sleep(.fromNanoseconds(@intCast(current_sleep_ns / 2)), .awake) catch |err| {
+                self.io.sleep(std.Io.Duration.fromNanoseconds(@intCast(current_sleep_ns / 2)), .awake) catch |err| {
                     Logger.WARN("sleep interrupted: {}", .{err});
                     return;
                 };
@@ -321,6 +322,7 @@ pub const Socket = struct {
         const msg = self._socket.receive(self.io, buffer) catch |err| {
             return .{ .error_fatal = err };
         };
+
         return .{ .success = .{
             .data = buffer[0..msg.data.len],
             .from_addr = msg.from,
