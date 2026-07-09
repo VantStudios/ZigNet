@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .BinaryStream = .{
-            .path = "libs/BinaryStream",
+            .url = "git+https://github.com/VantStudios/BinaryStream?ref=master#b86fa752f49db4472d1480aeb0c8cc83462d8b39",
+            .hash = "BinaryStream-0.0.0-gn8mmnJZAQAnFC-kkrSOzigRqEgMsHddZlmmGELc0jAv",
         },
     },
     .paths = .{

@@ -3,4 +3,5 @@
 # TODO! Re-Add docs.
 docs
 zig-out
+zig-pkg
 .idea/
