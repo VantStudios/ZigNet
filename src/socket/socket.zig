@@ -173,6 +173,15 @@ pub const Socket = struct {
             .mode = .dgram,
             .protocol = .udp,
         });
+
+        const enable: c_int = 1;
+        _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable)) catch {};
+
+        const recv_buf_size: c_int = 4 * 1024 * 1024;
+        _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&recv_buf_size)) catch {};
+
+        const send_buf_size: c_int = 4 * 1024 * 1024;
+        _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buf_size)) catch {};
     }
 
     pub fn listen(self: *Self) SocketError!void {
@@ -319,14 +328,19 @@ pub const Socket = struct {
     };
 
     fn receivePacket(self: *Self, buffer: []u8) ReceiveResult {
-        const msg = self._socket.receive(self.io, buffer) catch |err| {
-            return .{ .error_fatal = err };
+        const timeout: std.Io.Timeout = .{
+            .duration = .{
+                .raw = std.Io.Duration.fromNanoseconds(Config.SOCKET_RECV_TIMEOUT_MS * std.time.ns_per_ms),
+                .clock = .awake,
+            },
         };
 
-        return .{ .success = .{
-            .data = buffer[0..msg.data.len],
-            .from_addr = msg.from,
-        } };
+        const msg = self._socket.receiveTimeout(self.io, buffer, timeout) catch |err| switch (err) {
+            error.Timeout => return .{ .would_block = {} },
+            else => return .{ .error_fatal = err },
+        };
+
+        return .{ .success = .{ .data = buffer[0..msg.data.len], .from_addr = msg.from } };
     }
 
     pub fn stop(self: *Self) void {

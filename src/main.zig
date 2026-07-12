@@ -8,7 +8,7 @@ const Client = Raknet.Client;
 const Connection = Raknet.Connection;
 const Logger = Raknet.Logger;
 
-const SERVER = false; // true = run server, false = run client
+const SERVER = true; // true = run server, false = run client
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
