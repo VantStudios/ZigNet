@@ -45,7 +45,7 @@ pub const ConnectionRequest1 = struct {
         _ = try Int8.read(&stream);
         try Magic.read(&stream);
         const protocol = try stream.readUint8();
-        var mtu_size = @as(u16, @intCast(stream.getBuffer()));
+        var mtu_size = @as(u16, @intCast(stream.getBuffer().len));
         if (mtu_size + Server.UDP_HEADER_SIZE <= Server.MAX_MTU_SIZE) {
             mtu_size = mtu_size + Server.UDP_HEADER_SIZE;
         } else {

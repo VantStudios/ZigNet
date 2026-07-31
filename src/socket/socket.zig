@@ -174,14 +174,35 @@ pub const Socket = struct {
             .protocol = .udp,
         });
 
-        const enable: c_int = 1;
-        _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable)) catch {};
+        if (builtin.os.tag == .windows) {
+            const ws2 = std.os.windows.ws2_32;
+            const sol_socket = ws2.SOL.SOCKET;
+            const so_reuseaddr = ws2.SO.REUSEADDR;
+            const so_rcvbuf = ws2.SO.RCVBUF;
+            const so_sndbuf = ws2.SO.SNDBUF;
 
-        const recv_buf_size: c_int = 4 * 1024 * 1024;
-        _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&recv_buf_size)) catch {};
+            const setsockopt = struct {
+                pub extern fn setsockopt(s: usize, level: i32, optname: u32, optval: ?*const anyopaque, optlen: u32) c_int;
+            }.setsockopt;
 
-        const send_buf_size: c_int = 4 * 1024 * 1024;
-        _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buf_size)) catch {};
+            const enable: c_int = 1;
+            _ = setsockopt(@intFromPtr(self._socket.handle), sol_socket, so_reuseaddr, &enable, @sizeOf(c_int));
+
+            const recv_buf_size: c_int = 4 * 1024 * 1024;
+            _ = setsockopt(@intFromPtr(self._socket.handle), sol_socket, so_rcvbuf, &recv_buf_size, @sizeOf(c_int));
+
+            const send_buf_size: c_int = 4 * 1024 * 1024;
+            _ = setsockopt(@intFromPtr(self._socket.handle), sol_socket, so_sndbuf, &send_buf_size, @sizeOf(c_int));
+        } else {
+            const enable: c_int = 1;
+            _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable)) catch {};
+
+            const recv_buf_size: c_int = 4 * 1024 * 1024;
+            _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&recv_buf_size)) catch {};
+
+            const send_buf_size: c_int = 4 * 1024 * 1024;
+            _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buf_size)) catch {};
+        }
     }
 
     pub fn listen(self: *Self) SocketError!void {

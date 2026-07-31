@@ -66,4 +66,24 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    const bench_connection = b.addExecutable(.{
+        .name = "connection_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/connection_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "Raknet", .module = mod },
+                .{ .name = "BinaryStream", .module = binarystream_dep.module("BinaryStream") },
+            },
+        }),
+    });
+    if (target.result.os.tag == .windows) {
+        bench_connection.root_module.linkSystemLibrary("ws2_32", .{});
+    }
+    const bench_cmd = b.addRunArtifact(bench_connection);
+    if (b.args) |args| bench_cmd.addArgs(args);
+    const bench_step = b.step("bench", "Run connection benchmark");
+    bench_step.dependOn(&bench_cmd.step);
 }
