@@ -18,7 +18,7 @@ A high-performance RakNet implementation written in Zig, providing reliable UDP 
 Add ZigNet to your project:
 
 ```bash
-zig fetch --save git+https://github.com/VantStudios/ZigNet
+zig fetch --save git+https://github.com/VantStudios/ZigNet.git
 ```
 
 Then add it to your `build.zig`:
