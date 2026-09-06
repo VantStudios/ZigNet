@@ -3,8 +3,6 @@ const posix = std.posix;
 const net = std.Io.net;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
-const Mutex = std.Io.Mutex;
-const Atomic = std.atomic.Value;
 const builtin = @import("builtin");
 
 const Logger = @import("../misc/Logger.zig").Logger;
@@ -33,70 +31,7 @@ pub const CallbackFn = *const fn (
 const Config = struct {
     const BUFFER_SIZE = 8192;
     const MAX_PACKETS_PER_BATCH = 128;
-    // Sleep times for different states
-    const BASE_SLEEP_NS = 10_000; // 0.01ms - responsive
-    const IDLE_SLEEP_NS = 500_000; // 0.5ms - light idle
-    const MAX_IDLE_SLEEP_NS = 2_000_000; // 2ms - max idle
-    const IDLE_THRESHOLD = 20;
-    const DEEP_IDLE_THRESHOLD = 200;
-    const MAX_CONSECUTIVE_ERRORS = 15;
     const SOCKET_RECV_TIMEOUT_MS = 10;
-};
-
-const PacketBuffer = struct {
-    data: [Config.BUFFER_SIZE]u8,
-    used: bool,
-};
-
-const BufferPool = struct {
-    io: std.Io,
-    buffers: []PacketBuffer,
-    mutex: Mutex,
-    allocator: Allocator,
-
-    fn init(io: std.Io, allocator: Allocator, pool_size: usize) !BufferPool {
-        const buffers = try allocator.alloc(PacketBuffer, pool_size);
-        for (buffers) |*buffer| {
-            buffer.used = false;
-        }
-
-        return BufferPool{
-            .io = io,
-            .buffers = buffers,
-            .mutex = Mutex.init,
-            .allocator = allocator,
-        };
-    }
-
-    fn deinit(self: *BufferPool) void {
-        self.allocator.free(self.buffers);
-    }
-
-    fn acquire(self: *BufferPool) ?*PacketBuffer {
-        self.mutex.lock(self.io) catch |err| {
-            Logger.WARN("mutex lock failed: {}", .{err});
-            return null;
-        };
-        defer self.mutex.unlock(self.io);
-
-        for (self.buffers) |*buffer| {
-            if (!buffer.used) {
-                buffer.used = true;
-                return buffer;
-            }
-        }
-        return null;
-    }
-
-    fn release(self: *BufferPool, buffer: *PacketBuffer) void {
-        self.mutex.lock(self.io) catch |err| {
-            Logger.WARN("mutex lock failed: {}", .{err});
-            return;
-        };
-        defer self.mutex.unlock(self.io);
-
-        buffer.used = false;
-    }
 };
 
 pub const Socket = struct {
@@ -110,19 +45,16 @@ pub const Socket = struct {
 
     // Threading
     thread: ?Thread,
-    should_stop: Atomic(bool),
-    is_listening: Atomic(bool),
+    should_stop: std.atomic.Value(bool),
+    is_listening: std.atomic.Value(bool),
 
     // Callback system
     callback: ?CallbackFn,
     context: ?*anyopaque,
-    callback_mutex: Mutex,
-
-    // Buffer management
-    buffer_pool: BufferPool,
+    callback_mutex: std.Io.Mutex,
 
     // Error handling
-    consecutive_errors: Atomic(u32),
+    consecutive_errors: std.atomic.Value(u32),
 
     // Platform-specific
     winsock_initialized: if (builtin.os.tag == .windows) bool else void,
@@ -133,27 +65,21 @@ pub const Socket = struct {
             return SocketError.AddressParseError;
         };
 
-        var buffer_pool = BufferPool.init(io, allocator, 64) catch {
-            return SocketError.OutOfMemory;
-        };
-
         var self = Self{
             .io = io,
             .allocator = allocator,
             .bind_address = bind_address,
             .thread = null,
-            .should_stop = Atomic(bool).init(false),
-            .is_listening = Atomic(bool).init(false),
+            .should_stop = std.atomic.Value(bool).init(false),
+            .is_listening = std.atomic.Value(bool).init(false),
             .callback = null,
             .context = null,
-            .callback_mutex = Mutex.init,
-            .buffer_pool = buffer_pool,
-            .consecutive_errors = Atomic(u32).init(0),
+            .callback_mutex = std.Io.Mutex.init,
+            .consecutive_errors = std.atomic.Value(u32).init(0),
             .winsock_initialized = if (builtin.os.tag == .windows) false else {},
         };
 
         self.createSocket() catch |err| {
-            buffer_pool.deinit();
             return err;
         };
 
@@ -161,6 +87,9 @@ pub const Socket = struct {
     }
 
     fn parseAddress(host: []const u8, port: u16) !net.IpAddress {
+        if (std.mem.indexOfScalar(u8, host, ':') != null) {
+            return net.IpAddress.parseIp6(host, port);
+        }
         if (std.mem.eql(u8, host, "0.0.0.0") or host.len == 0) {
             return net.IpAddress.parseIp4("0.0.0.0", port);
         }
@@ -177,7 +106,6 @@ pub const Socket = struct {
         if (builtin.os.tag == .windows) {
             const ws2 = std.os.windows.ws2_32;
             const sol_socket = ws2.SOL.SOCKET;
-            const so_reuseaddr = ws2.SO.REUSEADDR;
             const so_rcvbuf = ws2.SO.RCVBUF;
             const so_sndbuf = ws2.SO.SNDBUF;
 
@@ -185,18 +113,12 @@ pub const Socket = struct {
                 pub extern fn setsockopt(s: usize, level: i32, optname: u32, optval: ?*const anyopaque, optlen: u32) c_int;
             }.setsockopt;
 
-            const enable: c_int = 1;
-            _ = setsockopt(@intFromPtr(self._socket.handle), sol_socket, so_reuseaddr, &enable, @sizeOf(c_int));
-
             const recv_buf_size: c_int = 4 * 1024 * 1024;
             _ = setsockopt(@intFromPtr(self._socket.handle), sol_socket, so_rcvbuf, &recv_buf_size, @sizeOf(c_int));
 
             const send_buf_size: c_int = 4 * 1024 * 1024;
             _ = setsockopt(@intFromPtr(self._socket.handle), sol_socket, so_sndbuf, &send_buf_size, @sizeOf(c_int));
         } else {
-            const enable: c_int = 1;
-            _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable)) catch {};
-
             const recv_buf_size: c_int = 4 * 1024 * 1024;
             _ = posix.setsockopt(self._socket.handle, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&recv_buf_size)) catch {};
 
@@ -219,86 +141,41 @@ pub const Socket = struct {
         };
 
         self.is_listening.store(true, .release);
-        // std.log.info("Socket listening on {any}", .{self.bind_address});
     }
 
-    // Improved receive loop with CPU-efficient adaptive sleeping
+    // recv with a timeout already yields the CPU; extra sleeps add latency
     fn receiveLoop(self: *Self) void {
+        var recv_buffer: [Config.BUFFER_SIZE]u8 = undefined;
         var packets_processed: u32 = 0;
-        var consecutive_no_data: u32 = 0;
-        var current_sleep_ns: u64 = Config.BASE_SLEEP_NS;
 
         while (!self.should_stop.load(.acquire)) {
             packets_processed = 0;
-            var buffer_shortage = false;
 
             // Process multiple packets in a batch
             while (packets_processed < Config.MAX_PACKETS_PER_BATCH) {
-                const buffer = self.buffer_pool.acquire() orelse {
-                    buffer_shortage = true;
-                    break;
-                };
-
-                defer self.buffer_pool.release(buffer);
-
-                const result = self.receivePacket(buffer.data[0..]);
+                const result = self.receivePacket(&recv_buffer);
 
                 switch (result) {
                     .success => |packet_info| {
                         self.consecutive_errors.store(0, .release);
-                        consecutive_no_data = 0;
-                        // Reset sleep time when data arrives - be responsive
-                        current_sleep_ns = Config.BASE_SLEEP_NS;
-
                         if (packet_info) |info| {
                             self.handlePacket(info.data, info.from_addr);
                             packets_processed += 1;
                         }
                     },
                     .would_block => {
-                        consecutive_no_data += 1;
-                        // Gradually increase sleep time as we detect inactivity
-                        if (consecutive_no_data > Config.DEEP_IDLE_THRESHOLD) {
-                            // Cap the maximum sleep time to avoid becoming too unresponsive
-                            current_sleep_ns = @min(Config.MAX_IDLE_SLEEP_NS, current_sleep_ns + (current_sleep_ns / 8) // Increase by 12.5% (was 25%)
-                            );
-                        } else if (consecutive_no_data > Config.IDLE_THRESHOLD) {
-                            // Medium idle - slowly increase sleep time
-                            current_sleep_ns = @min(Config.IDLE_SLEEP_NS, current_sleep_ns + 5_000 // Increase by 0.005ms (was 0.01ms)
-                            );
-                        }
-                        break; // No more data available
-                    },
-                    .error_recoverable => |err| {
-                        self.handleRecoverableError(err);
-                        break;
+                        break; // No more data available right now
                     },
                     .error_fatal => |err| {
                         std.log.err("Fatal socket error: {any}", .{err});
+                        self.is_listening.store(false, .release);
                         return;
                     },
                 }
             }
-
-            // Adaptive sleep strategy based on system activity
-            if (buffer_shortage) {
-                // Sleep briefly to let buffers free up
-                self.io.sleep(std.Io.Duration.fromNanoseconds(@intCast(current_sleep_ns / 2)), .awake) catch |err| {
-                    Logger.WARN("sleep interrupted: {}", .{err});
-                    return;
-                };
-            } else if (packets_processed == 0) {
-                // No packets processed, use adaptive sleep
-                self.io.sleep(.fromNanoseconds(@intCast(current_sleep_ns)), .awake) catch |err| {
-                    Logger.WARN("sleep interrupted: {}", .{err});
-                    return;
-                };
-            }
-            // When packets were processed, loop immediately without sleeping
         }
     }
 
-    // More efficient packet handling with better memory management
     fn handlePacket(self: *Self, data: []const u8, from_addr: net.IpAddress) void {
         self.callback_mutex.lock(self.io) catch |err| {
             Logger.WARN("mutex lock failed: {}", .{err});
@@ -320,26 +197,9 @@ pub const Socket = struct {
         }
     }
 
-    fn handleRecoverableError(self: *Self, err: anyerror) void {
-        const error_count = self.consecutive_errors.fetchAdd(1, .acq_rel) + 1;
-
-        // Only log errors for the first few occurrences to avoid spamming
-        if (error_count <= 3) {
-            std.log.warn("Socket error ({any}): {any}", .{ error_count, err });
-        } else if (error_count == 5 or error_count % 100 == 0) {
-            // Only log periodically after many errors
-            std.log.err("Network errors continuing (count: {d}), client likely disconnected", .{error_count});
-            self.io.sleep(.fromNanoseconds(@intCast(Config.IDLE_SLEEP_NS)), .awake) catch return; // Longer backoff
-        } else {
-            // Just back off without logging
-            self.io.sleep(.fromNanoseconds(@intCast(Config.BASE_SLEEP_NS * 5)), .awake) catch return;
-        }
-    }
-
     const ReceiveResult = union(enum) {
         success: ?PacketInfo,
         would_block: void,
-        error_recoverable: anyerror,
         error_fatal: anyerror,
     };
 
@@ -358,8 +218,19 @@ pub const Socket = struct {
 
         const msg = self._socket.receiveTimeout(self.io, buffer, timeout) catch |err| switch (err) {
             error.Timeout => return .{ .would_block = {} },
-            else => return .{ .error_fatal = err },
+            error.Canceled => return .{ .error_fatal = err },
+            // transient (EINTR, ENOBUFS, ...): back off and keep receiving
+            else => {
+                const error_count = self.consecutive_errors.fetchAdd(1, .acq_rel) + 1;
+                if (error_count <= 3 or error_count % 100 == 0) {
+                    std.log.warn("Socket receive error (count: {d}): {any}", .{ error_count, err });
+                }
+                self.io.sleep(.fromNanoseconds(10_000), .awake) catch return .{ .error_fatal = err };
+                return .{ .would_block = {} };
+            },
         };
+
+        if (msg.data.len == 0) return .{ .success = null };
 
         return .{ .success = .{ .data = buffer[0..msg.data.len], .from_addr = msg.from } };
     }
@@ -381,7 +252,6 @@ pub const Socket = struct {
     pub fn deinit(self: *Self) void {
         self.stop();
         self._socket.close(self.io);
-        self.buffer_pool.deinit();
     }
 
     pub fn setCallback(self: *Self, callback: CallbackFn, context: ?*anyopaque) void {
