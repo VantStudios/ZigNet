@@ -5,16 +5,50 @@ const Logger = @import("../misc/Logger.zig").Logger;
 const Proto = @import("../proto/root.zig");
 const Frame = Proto.Frame;
 const Reliability = Proto.Reliability;
-const Server = @import("./Server.zig").Server;
+const ServerModule = @import("./Server.zig");
+const Server = ServerModule.Server;
 
-const MAX_ACTIVE_FRAGMENTATIONS = 32;
+const MAX_CHANNELS = 32;
 const MAX_ORDERING_QUEUE_SIZE = 64;
+const MAX_SPLIT_SIZE: u32 = 1024;
+const MAX_FRAGMENT_SETS = 256;
+const FRAGMENT_TIMEOUT_NS: i64 = 10 * std.time.ns_per_s;
+const MAX_LOST_GAP: u32 = 4096;
+const MAX_PENDING_SEQUENCES = 8192;
+const RETRANSMIT_TIMEOUT_NS: i64 = 200 * std.time.ns_per_ms;
+const MAX_RETRANSMITS: u8 = 10;
+const MAX_RETRANSMITS_PER_TICK: usize = 32;
+// 3 + 384*4 = 1539: worst-case ACK datagram; a bigger batch would fail to
+// serialize every tick and never ack.
+const MAX_ACK_BATCH: usize = 384;
+const MAX_FRAMES_PER_TICK: usize = 128;
+const DATAGRAM_SCRATCH_SIZE = 1600;
+
+comptime {
+    std.debug.assert(3 + MAX_ACK_BATCH * 4 <= DATAGRAM_SCRATCH_SIZE);
+    std.debug.assert(DATAGRAM_SCRATCH_SIZE >= ServerModule.MAX_MTU_SIZE);
+}
 
 const PERFORM_TIME_CHECKS = false;
 const DEBUG = false;
 
 // Game packet callback for Connection (packet ID 254)
 pub const GamePacketCallback = *const fn (connection: *Connection, payload: []const u8, context: ?*anyopaque) void;
+
+pub const BackupEntry = struct {
+    bytes: []u8,
+    sent_ns: i64,
+    retries: u8,
+};
+
+const ChannelQueue = std.AutoHashMap(u32, Frame);
+const FragmentSet = std.AutoHashMap(u16, Frame);
+
+fn initMapCapacity(comptime K: type, comptime V: type, allocator: std.mem.Allocator, capacity: u32) std.AutoHashMap(K, V) {
+    var map = std.AutoHashMap(K, V).init(allocator);
+    map.ensureTotalCapacity(capacity) catch {}; // best effort: grows on demand
+    return map;
+}
 
 pub const Connection = struct {
     const Self = @This();
@@ -30,19 +64,14 @@ pub const Connection = struct {
     created_at: Timestamp,
     game_packet_callback: ?GamePacketCallback = null,
     game_packet_context: ?*anyopaque = null,
-    tickCounter: u64 = 0,
+    tick_counter: u64 = 0,
     last_ping_time: std.Io.Timestamp = .zero,
     ping_interval: std.Io.Duration = .fromMilliseconds(5000),
     send_mutex: std.Io.Mutex = .init,
+    pending_connect_event: bool = false,
+    send_scratch: [DATAGRAM_SCRATCH_SIZE]u8 = undefined,
 
-    pub fn init(server: *Server, address: std.Io.net.IpAddress, mtu_size: u16, guid: i64) !Self {
-        var input_ordering_queue = std.AutoHashMap(u32, std.AutoHashMap(u32, Frame)).init(server.options.allocator);
-        var i: u32 = 0;
-
-        while (i < MAX_ACTIVE_FRAGMENTATIONS) : (i += 1) {
-            try input_ordering_queue.put(i, std.AutoHashMap(u32, Frame).init(server.options.allocator));
-        }
-
+    pub fn init(server: *Server, address: std.Io.net.IpAddress, mtu_size: u16, guid: i64) Self {
         return Self{
             .server = server,
             .address = address,
@@ -52,19 +81,20 @@ pub const Connection = struct {
             .connected = false,
             .active = true,
             .comm_data = .{
-                .received_sequences = std.AutoHashMap(u24, void).init(server.options.allocator),
-                .lost_sequences = std.AutoHashMap(u24, void).init(server.options.allocator),
-                .input_order_index = [_]u32{0} ** MAX_ACTIVE_FRAGMENTATIONS,
-                .input_highest_sequence_index = [_]u32{0} ** MAX_ACTIVE_FRAGMENTATIONS,
-                .input_ordering_queue = input_ordering_queue,
+                .received_sequences = initMapCapacity(u24, void, server.options.allocator, 16),
+                .lost_sequences = initMapCapacity(u24, void, server.options.allocator, 16),
+                .input_order_index = [_]u32{0} ** MAX_CHANNELS,
+                .input_highest_sequence_index = [_]u32{0} ** MAX_CHANNELS,
+                .input_ordering_channels = [_]?ChannelQueue{null} ** MAX_CHANNELS,
                 .output_reliable_index = 0,
                 .output_sequence = 0,
                 .output_frame_queue = std.ArrayList(Frame).initBuffer(&[_]Frame{}),
-                .output_backup = std.AutoHashMap(u24, []Frame).init(server.options.allocator),
-                .output_order_index = [_]u32{0} ** MAX_ACTIVE_FRAGMENTATIONS,
-                .output_sequence_index = [_]u32{0} ** MAX_ACTIVE_FRAGMENTATIONS,
+                .output_backup = initMapCapacity(u24, BackupEntry, server.options.allocator, 64),
+                .output_order_index = [_]u32{0} ** MAX_CHANNELS,
+                .output_sequence_index = [_]u32{0} ** MAX_CHANNELS,
                 .output_split_index = 0,
-                .fragments_queue = std.AutoHashMap(u16, std.AutoHashMap(u16, Frame)).init(server.options.allocator),
+                .fragments_queue = initMapCapacity(u16, FragmentSet, server.options.allocator, 8),
+                .fragments_activity = initMapCapacity(u16, Timestamp, server.options.allocator, 8),
             },
             .last_receive = Timestamp.now(server.io, .awake),
             .created_at = Timestamp.now(server.io, .awake),
@@ -77,13 +107,14 @@ pub const Connection = struct {
 
     pub fn handlePacket(self: *Self, payload: []const u8) !void {
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
+        if (payload.len == 0) return;
         const ID = payload[0];
 
         const allocator = self.server.options.allocator;
 
         switch (ID) {
             Proto.Packets.ConnectionRequest => {
-                var request = try Proto.ConnectionRequest.deserialize(payload, allocator);
+                var request = try Proto.ConnectionRequest.deserialize(payload);
                 defer request.deinit();
 
                 const empty_address = Proto.Address.init(4, "0.0.0.0", 0);
@@ -93,13 +124,13 @@ pub const Connection = struct {
                     empty_address,
                     request.timestamp,
                     Timestamp.now(self.server.io, .real).toMilliseconds(),
-                    allocator,
                 );
 
                 defer accepted.deinit(allocator);
 
-                const serialized = try accepted.serialize(allocator);
-                const frame = frameIn(serialized, allocator);
+                var accepted_buf: [Proto.ConnectionRequestAccepted.MAX_SERIALIZED_SIZE]u8 = undefined;
+                const serialized = try accepted.serializeInto(&accepted_buf);
+                const frame = try frameIn(serialized, allocator);
 
                 self.sendFrame(frame, .Immediate);
             },
@@ -110,10 +141,8 @@ pub const Connection = struct {
                 if (DEBUG)
                     Logger.DEBUG("Connection established in {d}ms", .{elapsed.toMilliseconds()});
 
-                // Trigger server connect callback
-                if (self.server.connect_callback) |callback| {
-                    callback(self, self.server.connect_context);
-                }
+                // fired by Server after it releases connections_mutex
+                self.pending_connect_event = true;
             },
             Proto.Packets.DisconnectNotification => {
                 self.connected = false;
@@ -123,12 +152,10 @@ pub const Connection = struct {
                 // Game packet - trigger connection game packet callback
                 if (self.game_packet_callback) |callback| {
                     callback(self, payload, self.game_packet_context);
-                } else {
-                    Logger.WARN("Received game packet (254) but no callback set", .{});
                 }
             },
             Proto.Packets.ConnectedPing => {
-                var ping = Proto.ConnectedPing.deserialize(payload, allocator) catch |err| {
+                var ping = Proto.ConnectedPing.deserialize(payload) catch |err| {
                     Logger.ERROR("Failed to deserialize ConnectedPing: {any}", .{err});
                     return;
                 };
@@ -136,22 +163,20 @@ pub const Connection = struct {
                 defer ping.deinit();
 
                 const current_time_ms = Timestamp.now(self.server.io, .real).toMilliseconds();
-                var pong = Proto.ConnectedPong.init(ping.timestamp, current_time_ms, allocator);
+                var pong = Proto.ConnectedPong.init(ping.timestamp, current_time_ms);
                 defer pong.deinit();
 
-                const serialized = pong.serialize() catch |err| {
+                var pong_buf: [Proto.ConnectedPong.MAX_SERIALIZED_SIZE]u8 = undefined;
+                const serialized = pong.serializeInto(&pong_buf) catch |err| {
                     Logger.ERROR("Failed to serialize ConnectedPong: {any}", .{err});
                     return;
                 };
 
-                const frame = frameIn(serialized, allocator);
+                const frame = try frameIn(serialized, allocator);
                 self.sendFrame(frame, .Immediate);
-
-                if (DEBUG)
-                    Logger.DEBUG("Responded to ConnectedPing with ConnectedPong", .{});
             },
             Proto.Packets.ConnectedPong => {
-                var pong = Proto.ConnectedPong.deserialize(payload, allocator) catch |err| {
+                var pong = Proto.ConnectedPong.deserialize(payload) catch |err| {
                     Logger.ERROR("Failed to deserialize ConnectedPong: {any}", .{err});
                     return;
                 };
@@ -169,7 +194,7 @@ pub const Connection = struct {
             },
         }
         if (start_time) |start| {
-            const elapsed = start.untilNow(self.io, .awake);
+            const elapsed = start.untilNow(self.server.io, .awake);
             Logger.DEBUG("PERF: handlePacket took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
@@ -181,31 +206,26 @@ pub const Connection = struct {
         const elapsed = self.last_receive.untilNow(self.server.io, .awake);
 
         if (elapsed.toMilliseconds() > 15000) {
-            Logger.WARN("info ms {d}", .{elapsed.toMilliseconds()});
             Logger.WARN("Connection {any} has not received any packets in 15000ms", .{self.address});
             self.active = false;
             return;
         }
 
         const allocator = self.server.options.allocator;
+        const now = Timestamp.now(self.server.io, .awake);
 
-        const MAX_FRAMES_PER_TICK: usize = 128;
-        var frames_sent_this_tick: usize = 0;
+        self.purgeStaleFragments(now);
 
         self.send_mutex.lock(self.server.io) catch |err| {
             Logger.WARN("mutex lock failed: {}", .{err});
             return;
         };
 
-        while (self.comm_data.output_frame_queue.items.len > 0 and frames_sent_this_tick < MAX_FRAMES_PER_TICK) {
-            const before_len = self.comm_data.output_frame_queue.items.len;
-            const batch = @min(MAX_FRAMES_PER_TICK - frames_sent_this_tick, before_len);
-
-            self.sendQueue(batch);
-
-            if (self.comm_data.output_frame_queue.items.len >= before_len) break;
-            frames_sent_this_tick += before_len - self.comm_data.output_frame_queue.items.len;
+        if (self.queuedFrameCount() > 0) {
+            self.sendQueueLocked(MAX_FRAMES_PER_TICK);
         }
+
+        self.retransmitTimedOut(now);
 
         self.send_mutex.unlock(self.server.io);
 
@@ -218,19 +238,23 @@ pub const Connection = struct {
                 sequences_list.append(allocator, key.*) catch continue;
             }
 
-            self.comm_data.received_sequences.clearRetainingCapacity();
+            if (sequences_list.items.len > 0) {
+                std.mem.sort(u32, sequences_list.items, {}, comptime std.sort.asc(u32));
 
-            if (sequences_list.items.len == 0) return; // Should not really happen.
+                const batch = sequences_list.items[0..@min(sequences_list.items.len, MAX_ACK_BATCH)];
 
-            var ack = Proto.Ack.init(sequences_list.items, allocator) catch return;
-            defer ack.deinit();
+                var ack_buf: [DATAGRAM_SCRATCH_SIZE]u8 = undefined;
+                const serialized = Proto.Ack.serializeInto(batch, Proto.Packets.Ack, &ack_buf) catch |err| {
+                    Logger.ERROR("Failed to serialize ack: {any}", .{err});
+                    return;
+                };
 
-            // Logger.DEBUG("> Sending acks with size {d}", .{sequences_list.items.len});
+                for (batch) |seq| {
+                    _ = self.comm_data.received_sequences.remove(@truncate(seq));
+                }
 
-            const serialized = try ack.serialize(allocator);
-            defer allocator.free(serialized);
-
-            self.send(serialized);
+                self.send(serialized);
+            }
         }
         if (self.comm_data.lost_sequences.count() > 0) {
             var sequences_list = std.ArrayList(u32).empty;
@@ -241,41 +265,36 @@ pub const Connection = struct {
                 sequences_list.append(allocator, key.*) catch continue;
             }
 
-            self.comm_data.lost_sequences.clearRetainingCapacity();
-            if (sequences_list.items.len == 0) return;
+            if (sequences_list.items.len > 0) {
+                std.mem.sort(u32, sequences_list.items, {}, comptime std.sort.asc(u32));
 
-            var nack = Proto.Ack.init(sequences_list.items, allocator) catch return;
-            defer nack.deinit();
-            // Logger.DEBUG("> Sending nacks with size {d}", .{sequences_list.items.len});
+                const batch = sequences_list.items[0..@min(sequences_list.items.len, MAX_ACK_BATCH)];
 
-            const serialized = try nack.serialize(allocator);
-            defer allocator.free(serialized);
+                var nack_buf: [DATAGRAM_SCRATCH_SIZE]u8 = undefined;
+                const serialized = Proto.Ack.serializeInto(batch, Proto.Packets.Nack, &nack_buf) catch |err| {
+                    Logger.ERROR("Failed to serialize nack: {any}", .{err});
+                    return;
+                };
 
-            var mutable_serialized = allocator.dupe(u8, serialized) catch |err| {
-                Logger.ERROR("Failed to allocate memory for nack packet: {any}", .{err});
-                return;
-            };
+                for (batch) |seq| {
+                    _ = self.comm_data.lost_sequences.remove(@truncate(seq));
+                }
 
-            defer allocator.free(mutable_serialized);
-            mutable_serialized[0] = Proto.Packets.Nack;
-
-            self.send(mutable_serialized);
-        }
-
-        if (self.tickCounter / 50 == 0) {}
-
-        // Send ping every ping_interval milliseconds if connected
-        if (self.connected) {
-            const current_time = std.Io.Timestamp.now(self.server.io, .awake);
-            const since_last_ping = self.last_ping_time.durationTo(current_time);
-
-            if (since_last_ping.nanoseconds >= self.ping_interval.nanoseconds) {
-                self.sendPing();
-                self.last_ping_time = current_time;
+                self.send(serialized);
             }
         }
 
-        self.tickCounter += 1;
+        // Send ping every ping_interval milliseconds if connected
+        if (self.connected) {
+            const since_last_ping = self.last_ping_time.durationTo(now);
+
+            if (since_last_ping.nanoseconds >= self.ping_interval.nanoseconds) {
+                self.sendPing();
+                self.last_ping_time = now;
+            }
+        }
+
+        self.tick_counter += 1;
 
         if (start_time) |start| {
             const tick_elapsed = start.untilNow(self.server.io, .awake);
@@ -291,14 +310,17 @@ pub const Connection = struct {
         var ack = try Proto.Ack.deserialize(payload, self.server.options.allocator);
         defer ack.deinit();
 
+        // output_backup belongs to send_mutex
+        self.send_mutex.lock(self.server.io) catch |err| {
+            Logger.WARN("mutex lock failed: {}", .{err});
+            return;
+        };
+        defer self.send_mutex.unlock(self.server.io);
+
         for (ack.sequences) |seq| {
-            const key = @as(u24, @intCast(seq));
-            if (self.comm_data.output_backup.get(key)) |iframes| {
-                for (iframes) |*frame| {
-                    defer frame.deinit(self.server.options.allocator);
-                }
-                self.server.options.allocator.free(iframes);
-                _ = self.comm_data.output_backup.remove(key);
+            const key: u24 = @truncate(seq);
+            if (self.comm_data.output_backup.fetchRemove(key)) |entry| {
+                self.server.options.allocator.free(entry.value.bytes);
             }
         }
 
@@ -313,20 +335,22 @@ pub const Connection = struct {
 
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
-        // Ack and Nack are same just different ids we do not check ids when deserializing so we can do this! :D
         var nack = try Proto.Ack.deserialize(payload, self.server.options.allocator);
         defer nack.deinit();
 
+        self.send_mutex.lock(self.server.io) catch |err| {
+            Logger.WARN("mutex lock failed: {}", .{err});
+            return;
+        };
+        defer self.send_mutex.unlock(self.server.io);
+
+        const now = Timestamp.now(self.server.io, .awake);
         for (nack.sequences) |seq| {
-            const key = @as(u24, @intCast(seq));
-
-            if (self.comm_data.output_backup.get(key)) |frame| {
-                var frameset = Proto.FrameSet.init(key, frame, self.server.options.allocator);
-                const serialized = frameset.serialize() catch continue;
-
-                self.send(serialized);
-
-                frameset.deinit(self.server.options.allocator);
+            const key: u24 = @truncate(seq);
+            if (self.comm_data.output_backup.getPtr(key)) |entry| {
+                self.send(entry.bytes);
+                entry.sent_ns = @intCast(now.nanoseconds);
+                entry.retries += 1;
             }
         }
 
@@ -340,14 +364,12 @@ pub const Connection = struct {
         if (!self.active) return;
 
         self.last_receive = Timestamp.now(self.server.io, .awake);
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .new(self.server.io, .awake) else null;
+        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         var frameSet = try Proto.FrameSet.deserialize(buffer, self.server.options.allocator);
         defer frameSet.deinit(self.server.options.allocator);
 
         const sequence = frameSet.sequence_number;
-        // Logger.DEBUG("Frameset {d}", .{frameSet.sequence_number});
-
         const last = self.comm_data.last_input_sequence;
         const is_older_than_last = last != -1 and sequence <= @as(u24, @intCast(@max(0, last)));
         const is_already_received = self.comm_data.received_sequences.contains(sequence);
@@ -356,17 +378,28 @@ pub const Connection = struct {
             return;
         }
 
+        if (self.comm_data.received_sequences.count() >= MAX_PENDING_SEQUENCES) {
+            self.comm_data.received_sequences.clearRetainingCapacity();
+        }
+
         self.comm_data.received_sequences.put(sequence, {}) catch {
             return;
         };
 
         _ = self.comm_data.lost_sequences.remove(sequence);
 
-        const last_seq = @as(u24, @intCast(@max(0, self.comm_data.last_input_sequence)));
-        if (sequence > last_seq + 1) {
-            var i: u24 = last_seq + 1;
-            while (i < sequence) : (i += 1) {
-                self.comm_data.lost_sequences.put(i, {}) catch {};
+        // big jumps are client restarts, not real loss
+        if (last >= 0 and sequence > last) {
+            const last_u32: u32 = @intCast(last);
+            if (sequence > last_u32) {
+                const gap: u32 = @as(u32, sequence) - last_u32 - 1;
+                if (gap > 0 and gap <= MAX_LOST_GAP) {
+                    var i: u32 = last_u32 + 1;
+                    while (i < sequence) : (i += 1) {
+                        if (self.comm_data.lost_sequences.count() >= MAX_PENDING_SEQUENCES) break;
+                        self.comm_data.lost_sequences.put(@truncate(i), {}) catch break;
+                    }
+                }
             }
         }
 
@@ -406,7 +439,7 @@ pub const Connection = struct {
 
         if (start_time) |start| {
             const elapsed = start.untilNow(self.server.io, .awake);
-            .Logger.DEBUG("PERF: handleFrame took {d} ms", .{elapsed.toMilliseconds()});
+            Logger.DEBUG("PERF: handleFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
@@ -415,21 +448,23 @@ pub const Connection = struct {
 
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
-        if (DEBUG)
-            Logger.DEBUG("Ordered Frame!", .{});
-
         const channel = frame.order_channel orelse {
             Logger.ERROR("Ordered frame missing order_channel", .{});
             return;
         };
+
+        if (channel >= MAX_CHANNELS) {
+            Logger.WARN("Ordered frame with invalid channel {d} dropped", .{channel});
+            return;
+        }
 
         const frame_index = frame.ordered_frame_index orelse {
             Logger.ERROR("Ordered frame missing ordered_frame_index", .{});
             return;
         };
 
-        if (frame.ordered_frame_index == self.comm_data.input_order_index[channel]) {
-            self.comm_data.input_highest_sequence_index[channel] = @as(u32, @intCast(0));
+        if (frame_index == self.comm_data.input_order_index[channel]) {
+            self.comm_data.input_highest_sequence_index[channel] = 0;
             self.comm_data.input_order_index[channel] = frame_index + 1;
 
             self.handlePacket(frame.payload) catch {
@@ -438,33 +473,26 @@ pub const Connection = struct {
             };
 
             var index = self.comm_data.input_order_index[channel];
-            var outOfOrderQueue = self.comm_data.input_ordering_queue.getPtr(channel);
-
-            if (outOfOrderQueue == null) {
-                Logger.ERROR("OutOfOrderQueue is null", .{});
-                return;
-            }
-
-            while (outOfOrderQueue.?.contains(index)) : (index += 1) {
-                const iframe = outOfOrderQueue.?.get(index);
-                if (iframe == null) break;
-
-                if (iframe) |iiframe| {
-                    self.handlePacket(iiframe.payload) catch |err| {
-                        Logger.ERROR("Failed to handle packet: {any}", .{err});
-                        iiframe.deinit(self.server.options.allocator);
-                        _ = outOfOrderQueue.?.remove(index);
+            if (self.orderingChannel(channel)) |queue| {
+                while (queue.contains(index)) {
+                    var iframe = queue.get(index).?;
+                    _ = queue.remove(index);
+                    self.handlePacket(iframe.payload) catch |err| {
+                        Logger.ERROR("Failed to handle ordered queued packet: {any}", .{err});
+                        iframe.deinit();
                         return;
                     };
-                    iiframe.deinit(self.server.options.allocator);
+                    iframe.deinit();
+                    index += 1;
                 }
-                _ = outOfOrderQueue.?.remove(index);
+                self.comm_data.input_order_index[channel] = index;
             }
-
-            self.comm_data.input_order_index[channel] = index;
         } else if (frame_index > self.comm_data.input_order_index[channel]) {
-            const unordered = self.comm_data.input_ordering_queue.getPtr(channel);
-            if (unordered) |map| {
+            if (self.orderingChannel(channel)) |queue| {
+                if (queue.count() >= MAX_ORDERING_QUEUE_SIZE) {
+                    Logger.WARN("Ordering queue full on channel {d}, dropping frame", .{channel});
+                    return;
+                }
                 const allocator = self.server.options.allocator;
                 const payload_copy = allocator.dupe(u8, frame.payload) catch {
                     Logger.ERROR("Failed to dupe payload for ordering queue", .{});
@@ -475,7 +503,7 @@ pub const Connection = struct {
                 frame_copy.payload = payload_copy;
                 frame_copy.allocator = allocator;
 
-                map.put(frame_index, frame_copy) catch |err| {
+                queue.put(frame_index, frame_copy) catch |err| {
                     Logger.ERROR("Failed to put frame in ordering queue: {any}", .{err});
                     allocator.free(payload_copy);
                     return;
@@ -490,7 +518,7 @@ pub const Connection = struct {
 
         if (start_time) |start| {
             const elapsed = start.untilNow(self.server.io, .awake);
-            .Logger.DEBUG("PERF: handleOrderedFrame took {d} ms", .{elapsed.toMilliseconds()});
+            Logger.DEBUG("PERF: handleOrderedFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
@@ -498,8 +526,8 @@ pub const Connection = struct {
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         const channel = frame.order_channel orelse 0;
-        if (channel >= MAX_ACTIVE_FRAGMENTATIONS) {
-            Logger.ERROR("Invalid channel: {d}", .{channel});
+        if (channel >= MAX_CHANNELS) {
+            Logger.WARN("Sequenced frame with invalid channel {d} dropped", .{channel});
             return;
         }
 
@@ -516,7 +544,6 @@ pub const Connection = struct {
         const current_highest = self.comm_data.input_highest_sequence_index[channel];
         if (frame_index >= current_highest and order_index >= self.comm_data.input_order_index[channel]) {
             self.comm_data.input_highest_sequence_index[channel] = frame_index + 1;
-            // Don't duplicate payload, just pass the original
             self.handlePacket(frame.payload) catch |err| {
                 Logger.ERROR("Failed to handle packet: {any}", .{err});
                 return;
@@ -545,23 +572,30 @@ pub const Connection = struct {
             return;
         };
 
-        const allocator = self.server.options.allocator;
+        if (split_size == 0 or split_size > MAX_SPLIT_SIZE) {
+            Logger.WARN("Split frame with invalid split_size {d} dropped", .{split_size});
+            return;
+        }
+        if (split_index >= split_size) {
+            Logger.WARN("Split frame with invalid split_index {d} dropped", .{split_index});
+            return;
+        }
 
-        // Check if we already have the fragment id
+        const allocator = self.server.options.allocator;
+        const index_u16: u16 = @intCast(split_index);
+
         if (self.comm_data.fragments_queue.getPtr(split_id)) |fragment| {
-            // Check if we already have this fragment index (duplicate)
-            if (fragment.contains(@as(u16, @intCast(split_index)))) {
-                // Duplicate fragment, ignore
+            // Duplicate fragment, ignore
+            if (fragment.contains(index_u16)) {
                 return;
             }
 
-            // Create a copy of the frame with duplicated payload to avoid use-after-free
             const payload_copy = allocator.dupe(u8, frame.payload) catch {
                 Logger.ERROR("Failed to duplicate frame payload", .{});
                 return;
             };
 
-            const frame_copy = Frame.init(
+            var frame_copy = Frame.init(
                 frame.reliable_frame_index,
                 frame.sequence_frame_index,
                 frame.ordered_frame_index,
@@ -574,63 +608,59 @@ pub const Connection = struct {
                 allocator,
             );
 
-            // Set the split frame to the fragment
-            fragment.put(@as(u16, @intCast(split_index)), frame_copy) catch {
+            fragment.put(index_u16, frame_copy) catch {
                 Logger.ERROR("Failed to put frame in fragment queue", .{});
-                allocator.free(payload_copy);
+                frame_copy.deinit();
                 return;
             };
+            self.comm_data.fragments_activity.put(split_id, Timestamp.now(self.server.io, .awake)) catch {};
 
-            // Check if we have all the fragments
             if (fragment.count() == split_size) {
-                var stream = Proto.BinaryStream.init(allocator, null, null);
-                defer stream.deinit();
-
-                // Loop through the fragments and write them to the stream
-                var index: u32 = 0;
+                var total_length: usize = 0;
+                var complete = true;
+                var index: u16 = 0;
                 while (index < split_size) : (index += 1) {
-                    // Get the split frame from the fragment
-                    const sframe = fragment.get(@as(u16, @intCast(index))) orelse {
-                        Logger.ERROR("Missing fragment at index {d}", .{index});
-                        return;
+                    const sframe = fragment.get(index) orelse {
+                        complete = false;
+                        break;
                     };
-
-                    // Write the payload to the stream
-                    try stream.write(sframe.payload);
+                    total_length += sframe.payload.len;
                 }
 
-                // Get the reconstructed payload
-                const reconstructed_payload = stream.getBufferOwned(allocator) catch {
-                    Logger.ERROR("Failed to get reconstructed payload", .{});
+                if (!complete) {
+                    Logger.WARN("Fragment set {d} incomplete despite count match", .{split_id});
+                    return;
+                }
+
+                const reconstructed = allocator.alloc(u8, total_length) catch {
+                    Logger.ERROR("Failed to allocate reconstructed payload", .{});
                     return;
                 };
 
-                // Construct the new frame with values from the original frame
-                const nframe = Frame.init(
+                var offset: usize = 0;
+                index = 0;
+                while (index < split_size) : (index += 1) {
+                    const sframe = fragment.get(index).?;
+                    @memcpy(reconstructed[offset .. offset + sframe.payload.len], sframe.payload);
+                    offset += sframe.payload.len;
+                }
+
+                var nframe = Frame.init(
                     frame.reliable_frame_index,
                     frame.sequence_frame_index,
                     frame.ordered_frame_index,
                     frame.order_channel,
                     frame.reliability,
-                    reconstructed_payload,
+                    reconstructed,
                     null, // split_frame_index - not split anymore
                     null, // split_id - not split anymore
                     null, // split_size - not split anymore
                     allocator,
                 );
 
-                // Clean up the fragments before removing from queue
-                var frag_iter = fragment.iterator();
-                while (frag_iter.next()) |entry| {
-                    entry.value_ptr.deinit(allocator);
-                }
+                // fragments are consumed; nframe owns its payload now
+                self.removeFragmentSet(split_id);
 
-                fragment.deinit();
-
-                // Delete the fragment id from the queue
-                _ = self.comm_data.fragments_queue.remove(split_id);
-
-                // Process the reconstructed frame directly instead of calling handleFrame recursively
                 if (nframe.isSequenced()) {
                     self.handleSequencedFrame(nframe);
                 } else if (nframe.isOrdered()) {
@@ -641,19 +671,22 @@ pub const Connection = struct {
                     };
                 }
 
-                // Clean up the reconstructed frame
-                nframe.deinit(allocator);
+                nframe.deinit();
             }
         } else {
-            // Add the fragment id to the queue
-            var new_fragment = std.AutoHashMap(u16, Frame).init(allocator);
+            if (self.comm_data.fragments_queue.count() >= MAX_FRAGMENT_SETS) {
+                Logger.WARN("Too many incomplete fragment sets, dropping split_id {d}", .{split_id});
+                return;
+            }
 
-            // Create a copy of the frame with duplicated payload to avoid use-after-free
+            var new_fragment = FragmentSet.init(allocator);
+            errdefer new_fragment.deinit();
+
             const payload_copy = allocator.dupe(u8, frame.payload) catch {
                 Logger.ERROR("Failed to duplicate frame payload", .{});
                 return;
             };
-            const frame_copy = Frame.init(
+            var frame_copy = Frame.init(
                 frame.reliable_frame_index,
                 frame.sequence_frame_index,
                 frame.ordered_frame_index,
@@ -666,30 +699,63 @@ pub const Connection = struct {
                 allocator,
             );
 
-            new_fragment.put(@as(u16, @intCast(split_index)), frame_copy) catch {
+            new_fragment.put(index_u16, frame_copy) catch {
                 Logger.ERROR("Failed to create new fragment queue", .{});
-                allocator.free(payload_copy);
+                frame_copy.deinit();
                 return;
             };
             self.comm_data.fragments_queue.put(split_id, new_fragment) catch {
                 Logger.ERROR("Failed to add fragment to queue", .{});
-                // Clean up the frame we just added
-                var iter = new_fragment.iterator();
-                while (iter.next()) |entry| {
-                    entry.value_ptr.deinit(allocator);
-                }
+                frame_copy.deinit();
                 new_fragment.deinit();
                 return;
             };
+            self.comm_data.fragments_activity.put(split_id, Timestamp.now(self.server.io, .awake)) catch {};
         }
     }
 
-    pub fn frameIn(msg: []const u8, allocator: std.mem.Allocator) Frame {
-        const payload_copy = allocator.dupe(u8, msg) catch |err| {
-            Logger.ERROR("Failed to duplicate payload: {any}", .{err});
-            return Frame.init(null, null, null, 0, Reliability.ReliableOrdered, &[_]u8{}, null, null, null, allocator);
-        };
+    fn removeFragmentSet(self: *Self, split_id: u16) void {
+        if (self.comm_data.fragments_queue.fetchRemove(split_id)) |entry| {
+            var fragment = entry.value;
+            var iter = fragment.iterator();
+            while (iter.next()) |frag_entry| {
+                frag_entry.value_ptr.deinit();
+            }
+            fragment.deinit();
+        }
+        _ = self.comm_data.fragments_activity.remove(split_id);
+    }
 
+    fn purgeStaleFragments(self: *Self, now: Timestamp) void {
+        var stale: [64]u16 = undefined;
+        var stale_count: usize = 0;
+
+        var iter = self.comm_data.fragments_activity.iterator();
+        while (iter.next()) |entry| {
+            const age_ns: i64 = @intCast(now.nanoseconds - entry.value_ptr.nanoseconds);
+            if (age_ns > FRAGMENT_TIMEOUT_NS and stale_count < stale.len) {
+                stale[stale_count] = entry.key_ptr.*;
+                stale_count += 1;
+            }
+        }
+
+        for (stale[0..stale_count]) |id| {
+            Logger.WARN("Fragment set {d} timed out incomplete, dropping", .{id});
+            self.removeFragmentSet(id);
+        }
+    }
+
+    fn orderingChannel(self: *Self, channel: usize) ?*ChannelQueue {
+        const slot = &self.comm_data.input_ordering_channels[channel];
+        if (slot.*) |*existing| {
+            return existing;
+        }
+        slot.* = ChannelQueue.init(self.server.options.allocator);
+        return &(slot.*.?);
+    }
+
+    pub fn frameIn(msg: []const u8, allocator: std.mem.Allocator) !Frame {
+        const payload_copy = try allocator.dupe(u8, msg);
         return Frame.init(null, null, null, 0, Reliability.ReliableOrdered, payload_copy, null, null, null, allocator);
     }
 
@@ -697,7 +763,10 @@ pub const Connection = struct {
         // Don't create frames for inactive connections - this prevents memory leaks
         if (!self.active) return;
 
-        var frame = frameIn(msg, self.server.options.allocator);
+        var frame = frameIn(msg, self.server.options.allocator) catch |err| {
+            Logger.ERROR("Failed to allocate reliable message: {any}", .{err});
+            return;
+        };
         frame.reliability = Reliability.ReliableOrdered;
 
         self.sendFrame(frame, priority);
@@ -706,12 +775,14 @@ pub const Connection = struct {
     pub fn sendFrame(self: *Connection, frame: Frame, priority: Priority) void {
         if (!self.active) {
             var f = frame;
-            f.deinit(self.server.options.allocator);
+            f.deinit();
             return;
         }
 
         self.send_mutex.lock(self.server.io) catch |err| {
             Logger.WARN("mutex lock failed: {}", .{err});
+            var f = frame;
+            f.deinit();
             return;
         };
 
@@ -719,8 +790,14 @@ pub const Connection = struct {
 
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
-        const channel_index = frame.order_channel orelse 0;
-        const channel = @as(usize, channel_index);
+        const channel = frame.order_channel orelse 0;
+        if (channel >= MAX_CHANNELS) {
+            Logger.WARN("sendFrame with invalid channel {d} dropped", .{channel});
+            var f = frame;
+            f.deinit();
+            return;
+        }
+
         var mutable_frame = frame;
 
         if (mutable_frame.isSequenced()) {
@@ -743,22 +820,15 @@ pub const Connection = struct {
                 mutable_frame.reliable_frame_index = self.comm_data.output_reliable_index;
                 self.comm_data.output_reliable_index += 1;
             }
-            self.queueFrame(mutable_frame, priority);
-
-            if (start_time) |start| {
-                const elapsed = start.untilNow(self.server.io, .awake);
-                Logger.DEBUG("PERF: sendFrame took {d} ms", .{elapsed.toMilliseconds()});
-            }
-
-            return;
+            self.queueFrameLocked(mutable_frame, priority);
         } else {
-            if (start_time) |start| {
-                const elapsed = start.untilNow(self.server.io, .awake);
-                Logger.DEBUG("PERF: sendFrame (large payload path) took {d} ms", .{elapsed.toMilliseconds()});
-            }
-
             const split_size = (payload_size + max_size - 1) / max_size;
             self.handleLargePayload(&mutable_frame, max_size, split_size, priority);
+        }
+
+        if (start_time) |start| {
+            const elapsed = start.untilNow(self.server.io, .awake);
+            Logger.DEBUG("PERF: sendFrame took {d} ms", .{elapsed.toMilliseconds()});
         }
     }
 
@@ -783,7 +853,6 @@ pub const Connection = struct {
             const end_index = @min(index + max_size, original_payload.len);
             const fragment_payload = original_payload[index..end_index];
 
-            // Create a copy of the fragment payload
             const payload_copy = allocator.dupe(u8, fragment_payload) catch {
                 Logger.ERROR("Failed to duplicate fragment payload", .{});
                 return;
@@ -794,39 +863,37 @@ pub const Connection = struct {
                 @as(u32, @intCast(split_size)), // split_size
                 allocator);
 
-            // Set reliable index for fragments after the first one
-            if (index != 0 and new_frame.isReliable()) {
-                new_frame.reliable_frame_index = self.comm_data.output_reliable_index;
-                self.comm_data.output_reliable_index += 1;
-            } else if (index == 0 and new_frame.isReliable()) {
+            if (new_frame.isReliable()) {
                 new_frame.reliable_frame_index = self.comm_data.output_reliable_index;
                 self.comm_data.output_reliable_index += 1;
             }
 
-            self.queueFrame(new_frame, priority);
+            self.queueFrameLocked(new_frame, priority);
             index += max_size;
         }
     }
 
-    pub fn queueFrame(self: *Connection, frame: Frame, priority: Priority) void {
+    // caller holds send_mutex
+    fn queueFrameLocked(self: *Connection, frame: Frame, priority: Priority) void {
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         // Don't queue frames if connection is not active - prevents leaks during shutdown
         if (!self.active) {
-            frame.deinit(self.server.options.allocator);
+            var f = frame;
+            f.deinit();
             return;
         }
 
         self.comm_data.output_frame_queue.append(self.server.options.allocator, frame) catch {
             Logger.ERROR("Failed to queue frame", .{});
-            defer frame.deinit(self.server.options.allocator);
+            var f = frame;
+            f.deinit();
             return;
         };
 
         const should_send_immediately = priority == Priority.Immediate;
-        const queue_len = self.comm_data.output_frame_queue.items.len;
         if (should_send_immediately) {
-            self.sendQueue(queue_len);
+            self.sendQueueLocked(self.queuedFrameCount());
         }
 
         if (start_time) |start| {
@@ -835,98 +902,95 @@ pub const Connection = struct {
         }
     }
 
-    pub fn sendQueue(self: *Connection, amount: usize) void {
+    fn queuedFrameCount(self: *Connection) usize {
+        return self.comm_data.output_frame_queue.items.len - self.comm_data.output_queue_head;
+    }
+
+    fn advanceQueueHead(self: *Connection, count: usize) void {
+        const c = &self.comm_data;
+        c.output_queue_head += count;
+
+        // memmove only once the dead prefix is large (amortized O(1))
+        if (c.output_queue_head == c.output_frame_queue.items.len) {
+            c.output_frame_queue.clearRetainingCapacity();
+            c.output_queue_head = 0;
+        } else if (c.output_queue_head >= 64 and c.output_queue_head * 2 >= c.output_frame_queue.items.len) {
+            c.output_frame_queue.replaceRange(self.server.options.allocator, 0, c.output_queue_head, &[_]Frame{}) catch {
+                return;
+            };
+            c.output_queue_head = 0;
+        }
+    }
+
+    // caller holds send_mutex
+    fn sendQueueLocked(self: *Connection, amount: usize) void {
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
-
-        if (self.comm_data.output_frame_queue.items.len == 0) return;
         const allocator = self.server.options.allocator;
+        const now = Timestamp.now(self.server.io, .awake);
 
-        // Calculate how many frames we can fit in one frameset without exceeding MTU
-        // Reserve space for frameset header (4 bytes) and some overhead
         const max_frameset_size = self.mtu_size - 28; // Leave room for UDP/IP headers
-        var current_size: usize = 4; // Frameset header size
-        var frames_to_send: usize = 0;
 
-        const queue_len = self.comm_data.output_frame_queue.items.len;
-        const max_frames = @min(amount, queue_len);
+        var processed: usize = 0;
+        while (processed < amount) {
+            const available = self.queuedFrameCount();
+            if (available == 0) break;
 
-        for (self.comm_data.output_frame_queue.items[0..max_frames]) |frame| {
-            // Calculate frame size: header (variable) + payload
-            // Frame header is roughly 3 bytes minimum + reliability fields
-            const frame_overhead: usize = 28; // Conservative estimate for frame header
-            const frame_size = frame_overhead + frame.payload.len;
+            const head = self.comm_data.output_queue_head;
+            const candidate = @min(available, amount - processed);
 
-            if (current_size + frame_size > max_frameset_size and frames_to_send > 0) {
-                // This frame would exceed MTU, stop here
-                break;
-            }
-
-            current_size += frame_size;
-            frames_to_send += 1;
-        }
-
-        if (frames_to_send == 0) {
-            // Single frame is too large? Send it anyway (it's already fragmented)
-            frames_to_send = 1;
-        }
-
-        const count = frames_to_send;
-        const frames = self.comm_data.output_frame_queue.items[0..count];
-
-        const backup = allocator.alloc(Frame, count) catch |err| {
-            Logger.ERROR("Backup alloc failed: {any}", .{err});
-            self.cleanupOutputQueueFrames(count);
-            return;
-        };
-
-        for (frames, 0..) |frame, i| {
-            const payload = if (frame.payload.len > 0)
-                allocator.dupe(u8, frame.payload) catch {
-                    for (0..i) |j| {
-                        backup[j].deinit(allocator);
-                    }
-
-                    allocator.free(backup);
-                    self.cleanupOutputQueueFrames(count);
-
-                    Logger.ERROR("Payload dupe failed at frame {any}", .{i});
-                    return;
+            var fit: usize = 0;
+            var current_size: usize = 4; // Frameset header size
+            for (self.comm_data.output_frame_queue.items[head .. head + candidate]) |frame| {
+                const frame_size = frame.getByteLength();
+                if (current_size + frame_size > max_frameset_size and fit > 0) {
+                    break;
                 }
-            else
-                &[_]u8{};
-
-            backup[i] = Frame.init(frame.reliable_frame_index, frame.sequence_frame_index, frame.ordered_frame_index, frame.order_channel, frame.reliability, payload, frame.split_frame_index, frame.split_id, frame.split_size, allocator);
-        }
-
-        const sequence = @as(u24, @truncate(self.comm_data.output_sequence));
-        self.comm_data.output_sequence += 1;
-
-        var frameset = Proto.FrameSet.init(sequence, backup, allocator);
-        const serialized = frameset.serialize() catch |err| {
-            Logger.ERROR("Failed to serialize frameset: {any}", .{err});
-            frameset.deinit(allocator);
-            return;
-        };
-
-        if (self.comm_data.output_backup.get(sequence)) |iframes| {
-            for (iframes) |*frame| {
-                defer frame.deinit(allocator);
+                current_size += frame_size;
+                fit += 1;
             }
-            allocator.free(iframes);
-            _ = self.comm_data.output_backup.remove(sequence);
-        }
+            if (fit == 0) fit = 1;
 
-        self.comm_data.output_backup.put(sequence, backup) catch |err| {
-            Logger.WARN("Backup store failed, sending without reliability: {any}", .{err});
-            for (backup) |*frame| {
-                frame.deinit(allocator);
+            const frames = self.comm_data.output_frame_queue.items[head .. head + fit];
+
+            const sequence: u24 = @truncate(self.comm_data.output_sequence);
+            self.comm_data.output_sequence += 1;
+
+            const serialized = Proto.FrameSet.serializeInto(sequence, frames, self.send_scratch[0..]) catch |err| {
+                Logger.ERROR("Failed to serialize frameset: {any}", .{err});
+                for (frames) |*frame| frame.deinit();
+                self.advanceQueueHead(fit);
+                processed += fit;
+                continue;
+            };
+
+            const backup_bytes = allocator.dupe(u8, serialized) catch |err| {
+                Logger.ERROR("Backup alloc failed: {any}", .{err});
+                for (frames) |*frame| frame.deinit();
+                self.advanceQueueHead(fit);
+                processed += fit;
+                continue;
+            };
+
+            // retire whatever previously occupied this sequence slot (u24 wrap)
+            if (self.comm_data.output_backup.fetchRemove(sequence)) |old| {
+                allocator.free(old.value.bytes);
             }
-            allocator.free(backup);
-        };
 
-        self.cleanupOutputQueueFrames(count);
-        self.send(serialized);
-        frameset.deinit(allocator);
+            self.comm_data.output_backup.put(sequence, .{
+                .bytes = backup_bytes,
+                .sent_ns = @intCast(now.nanoseconds),
+                .retries = 0,
+            }) catch |err| {
+                Logger.WARN("Backup store failed, sending without reliability: {any}", .{err});
+                allocator.free(backup_bytes);
+            };
+
+            self.send(serialized);
+
+            for (frames) |*frame| frame.deinit();
+            self.advanceQueueHead(fit);
+            processed += fit;
+        }
 
         if (start_time) |start| {
             const end_time = Timestamp.now(self.server.io, .awake);
@@ -935,20 +999,35 @@ pub const Connection = struct {
         }
     }
 
-    fn cleanupOutputQueueFrames(self: *Connection, amount: usize) void {
-        const queue = &self.comm_data.output_frame_queue;
-        const to_remove = @min(amount, queue.items.len);
+    fn retransmitTimedOut(self: *Connection, now: Timestamp) void {
+        var resent: usize = 0;
+        var dropped_key: ?u24 = null;
 
-        if (to_remove == 0) return;
+        var iter = self.comm_data.output_backup.iterator();
+        while (iter.next()) |entry| {
+            if (resent >= MAX_RETRANSMITS_PER_TICK) break;
 
-        for (queue.items[0..to_remove]) |*frame| {
-            frame.deinit(self.server.options.allocator);
+            const age_ns: i64 = @intCast(now.nanoseconds - entry.value_ptr.sent_ns);
+            if (age_ns < RETRANSMIT_TIMEOUT_NS) continue;
+
+            if (entry.value_ptr.retries >= MAX_RETRANSMITS) {
+                Logger.WARN("Connection {any} unresponsive (sequence {d} unacked after {d} retries)", .{ self.address, entry.key_ptr.*, entry.value_ptr.retries });
+                dropped_key = entry.key_ptr.*;
+                self.active = false;
+                break;
+            }
+
+            self.send(entry.value_ptr.bytes);
+            entry.value_ptr.sent_ns = @intCast(now.nanoseconds);
+            entry.value_ptr.retries += 1;
+            resent += 1;
         }
 
-        queue.replaceRange(self.server.options.allocator, 0, to_remove, &[_]Frame{}) catch |err| {
-            Logger.ERROR("Failed to cleanup output queue frames: {any}", .{err});
-            return;
-        };
+        if (dropped_key) |key| {
+            if (self.comm_data.output_backup.fetchRemove(key)) |entry| {
+                self.server.options.allocator.free(entry.value.bytes);
+            }
+        }
     }
 
     pub fn send(self: *Connection, data: []const u8) void {
@@ -961,13 +1040,19 @@ pub const Connection = struct {
         }
     }
 
+    pub fn takePendingConnect(self: *Self) bool {
+        const was_pending = self.pending_connect_event;
+        self.pending_connect_event = false;
+        return was_pending;
+    }
+
     /// Set game packet callback (for packet ID 254)
     pub fn setGamePacketCallback(self: *Connection, callback: ?GamePacketCallback, context: ?*anyopaque) void {
         self.game_packet_callback = callback;
         self.game_packet_context = context;
     }
 
-    pub fn getAddress(self: *const Connection) std.net.Address {
+    pub fn getAddress(self: *const Connection) std.Io.net.IpAddress {
         return self.address;
     }
 
@@ -984,19 +1069,20 @@ pub const Connection = struct {
         const allocator = self.server.options.allocator;
         const timestamp = Timestamp.now(self.server.io, .real).toMilliseconds();
 
-        var ping = Proto.ConnectedPing.init(timestamp, allocator);
+        var ping = Proto.ConnectedPing.init(timestamp);
         defer ping.deinit();
 
-        const serialized = ping.serialize() catch |err| {
+        var ping_buf: [Proto.ConnectedPing.MAX_SERIALIZED_SIZE]u8 = undefined;
+        const serialized = ping.serializeInto(&ping_buf) catch |err| {
             Logger.ERROR("Failed to serialize ConnectedPing: {any}", .{err});
             return;
         };
 
-        const frame = frameIn(serialized, allocator);
+        const frame = frameIn(serialized, allocator) catch |err| {
+            Logger.ERROR("Failed to allocate ping frame: {any}", .{err});
+            return;
+        };
         self.sendFrame(frame, .Normal);
-
-        if (DEBUG)
-            Logger.DEBUG("Sent ConnectedPing with timestamp: {d}", .{timestamp});
     }
 };
 
@@ -1004,66 +1090,58 @@ pub const CommData = struct {
     last_input_sequence: i32 = -1,
     received_sequences: std.AutoHashMap(u24, void),
     lost_sequences: std.AutoHashMap(u24, void),
-    input_order_index: [MAX_ACTIVE_FRAGMENTATIONS]u32,
-    input_highest_sequence_index: [MAX_ACTIVE_FRAGMENTATIONS]u32,
-    input_ordering_queue: std.AutoHashMap(u32, std.AutoHashMap(u32, Frame)),
+    input_order_index: [MAX_CHANNELS]u32,
+    input_highest_sequence_index: [MAX_CHANNELS]u32,
+    input_ordering_channels: [MAX_CHANNELS]?ChannelQueue,
 
     output_reliable_index: u32,
     output_sequence: u32,
     output_frame_queue: std.ArrayList(Frame),
-    output_backup: std.AutoHashMap(u24, []Frame),
-    output_order_index: [MAX_ACTIVE_FRAGMENTATIONS]u32,
-    output_sequence_index: [MAX_ACTIVE_FRAGMENTATIONS]u32,
+    output_queue_head: usize = 0,
+    output_backup: std.AutoHashMap(u24, BackupEntry),
+    output_order_index: [MAX_CHANNELS]u32,
+    output_sequence_index: [MAX_CHANNELS]u32,
     output_split_index: u16,
 
-    fragments_queue: std.AutoHashMap(u16, std.AutoHashMap(u16, Frame)),
+    fragments_queue: std.AutoHashMap(u16, FragmentSet),
+    fragments_activity: std.AutoHashMap(u16, Timestamp),
 
     pub fn deinit(self: *CommData, allocator: std.mem.Allocator) void {
         self.received_sequences.deinit();
         self.lost_sequences.deinit();
 
-        for (self.output_frame_queue.items) |*frame| {
-            frame.deinit(allocator);
+        // frames below the head were freed on send
+        for (self.output_frame_queue.items[self.output_queue_head..]) |*frame| {
+            frame.deinit();
         }
-
-        self.output_frame_queue.clearAndFree(allocator);
         self.output_frame_queue.deinit(allocator);
 
-        var outer_iterator = self.input_ordering_queue.valueIterator();
-        while (outer_iterator.next()) |inner_map| {
-            var inner_iterator = inner_map.iterator();
-            while (inner_iterator.next()) |inner_entry| {
-                inner_entry.value_ptr.deinit(allocator);
+        for (&self.input_ordering_channels) |*maybe_queue| {
+            if (maybe_queue.*) |*queue| {
+                var inner_iterator = queue.iterator();
+                while (inner_iterator.next()) |inner_entry| {
+                    inner_entry.value_ptr.deinit();
+                }
+                queue.deinit();
             }
-
-            inner_map.deinit();
         }
-
-        self.input_ordering_queue.deinit();
 
         var backup_iter = self.output_backup.iterator();
         while (backup_iter.next()) |entry| {
-            const frames = entry.value_ptr.*;
-            for (frames) |*frame| {
-                frame.deinit(allocator);
-            }
-
-            allocator.free(frames);
+            allocator.free(entry.value_ptr.bytes);
         }
-
         self.output_backup.deinit();
 
         var fragments_iter = self.fragments_queue.iterator();
         while (fragments_iter.next()) |outer_entry| {
             var inner_fragments_iter = outer_entry.value_ptr.iterator();
             while (inner_fragments_iter.next()) |inner_entry| {
-                inner_entry.value_ptr.deinit(allocator);
+                inner_entry.value_ptr.deinit();
             }
-
             outer_entry.value_ptr.deinit();
         }
-
         self.fragments_queue.deinit();
+        self.fragments_activity.deinit();
     }
 };
 
