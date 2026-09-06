@@ -9,6 +9,8 @@ pub const SocketError = @import("./socket/socket.zig").SocketError;
 pub const Logger = @import("./misc/Logger.zig").Logger;
 pub const LoggerColors = @import("./misc/Logger.zig").Colors;
 
+pub const Proto = @import("./proto/root.zig");
+
 pub const Client = @import("./client/client.zig").Client;
 pub const ClientOptions = @import("./client/client.zig").ClientOptions;
 
@@ -27,6 +29,9 @@ test "all" {
     std.testing.refAllDecls(@import("proto/online/ConnectionRequest.zig"));
     std.testing.refAllDecls(@import("proto/online/ConnectionRequestAccepted.zig"));
     std.testing.refAllDecls(@import("proto/online/FrameSet.zig"));
+
+    // zero-input smoke pass for the fuzz targets
+    std.testing.refAllDecls(@import("proto/fuzz.zig"));
 }
 
 const std = @import("std");
