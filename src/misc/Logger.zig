@@ -45,14 +45,16 @@ pub const Colors = struct {
 
 const std = @import("std");
 
-pub const DebugLevel = enum {
-    None,
-    Info,
-    Debug,
-    Memory,
+pub const DebugLevel = enum(u8) {
+    None = 0,
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+    Memory = 5,
 };
 
-var current_debug_level: DebugLevel = .None;
+var current_debug_level: std.atomic.Value(u8) = .init(@intFromEnum(DebugLevel.Info));
 
 var _io_impl: ?std.Io.Threaded = null;
 var _io: std.Io = undefined;
@@ -70,10 +72,15 @@ pub const Logger = struct {
     }
 
     pub fn setDebugLevel(level: DebugLevel) void {
-        current_debug_level = level;
+        current_debug_level.store(@intFromEnum(level), .release);
+    }
+
+    fn levelEnabled(min: DebugLevel) bool {
+        return current_debug_level.load(.acquire) >= @intFromEnum(min);
     }
 
     pub fn INFO(comptime fmt: []const u8, args: anytype) void {
+        if (!levelEnabled(.Info)) return;
         const timestamp = std.Io.Timestamp.now(getIo(), .real);
         const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp.toSeconds()) };
 
@@ -87,6 +94,7 @@ pub const Logger = struct {
     }
 
     pub fn ERROR(comptime fmt: []const u8, args: anytype) void {
+        if (!levelEnabled(.Error)) return;
         const timestamp = std.Io.Timestamp.now(getIo(), .real);
         const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp.toSeconds()) };
 
@@ -100,6 +108,7 @@ pub const Logger = struct {
     }
 
     pub fn WARN(comptime fmt: []const u8, args: anytype) void {
+        if (!levelEnabled(.Warn)) return;
         const timestamp = std.Io.Timestamp.now(getIo(), .real);
         const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp.toSeconds()) };
 
@@ -113,7 +122,7 @@ pub const Logger = struct {
     }
 
     pub fn DEBUG(comptime fmt: []const u8, args: anytype) void {
-        if (current_debug_level == .None) return;
+        if (!levelEnabled(.Debug)) return;
 
         const timestamp = std.Io.Timestamp.now(getIo(), .real);
         const localTime = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp.toSeconds()) };
