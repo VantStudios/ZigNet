@@ -40,7 +40,7 @@ fn runServer(io: std.Io, allocator: std.mem.Allocator) !void {
     server.setDisconnectCallback(onServerDisconnect, null);
     try server.start();
 
-    try io.sleep(Duration.fromSeconds(30), .awake);
+    try io.sleep(Duration.fromSeconds(300), .awake);
 }
 
 fn runClient(io: std.Io, allocator: std.mem.Allocator) !void {
