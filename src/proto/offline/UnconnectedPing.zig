@@ -2,64 +2,64 @@ const std = @import("std");
 const BinaryStream = @import("BinaryStream").BinaryStream;
 const Magic = @import("../Magic.zig").Magic;
 const Packets = @import("../Packets.zig").Packets;
-const Logger = @import("../../misc/Logger.zig").Logger;
 
 pub const UnconnectedPing = struct {
-    stream: BinaryStream,
+    pub const MAX_SERIALIZED_SIZE = 33; // id(1) + timestamp(8) + magic(16) + guid(8)
     timestamp: i64,
     guid: i64,
-    owns_stream: bool,
 
-    pub fn init(timestamp: i64, guid: i64, allocator: std.mem.Allocator) UnconnectedPing {
-        return .{
-            .stream = BinaryStream.init(allocator, null, null),
-            .timestamp = timestamp,
-            .guid = guid,
-            .owns_stream = false,
-        };
+    pub fn init(timestamp: i64, guid: i64) UnconnectedPing {
+        return .{ .timestamp = timestamp, .guid = guid };
     }
 
     pub fn deinit(self: *UnconnectedPing) void {
-        self.stream.deinit();
+        _ = self;
     }
 
-    pub fn serialize(self: *UnconnectedPing) ![]const u8 {
-        try self.stream.writeUint8(Packets.UnconnectedPing);
-        try self.stream.writeInt64(self.timestamp, .Big);
-        try Magic.write(&self.stream);
-        try self.stream.writeInt64(self.guid, .Big);
-        return self.stream.getBuffer();
+    /// Writes into `out` (zero allocs); returns a slice of it.
+    pub fn serializeInto(self: *const UnconnectedPing, out: []u8) ![]const u8 {
+        var s = BinaryStream{
+            .payload = out,
+            .written = 0,
+            .offset = 0,
+            .allocator = undefined,
+            .owns_buffer = false,
+        };
+
+        try s.writeUint8(Packets.UnconnectedPing);
+        try s.writeInt64(self.timestamp, .Big);
+        try Magic.write(&s);
+        try s.writeInt64(self.guid, .Big);
+        return s.getBuffer();
     }
 
-    pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !UnconnectedPing {
-        var stream = BinaryStream.init(allocator, data, null);
-        errdefer stream.deinit();
+    /// Allocating wrapper; caller owns the result.
+    pub fn serialize(self: *const UnconnectedPing, allocator: std.mem.Allocator) ![]const u8 {
+        var buf: [UnconnectedPing.MAX_SERIALIZED_SIZE]u8 = undefined;
+        return allocator.dupe(u8, try self.serializeInto(&buf));
+    }
+
+    pub fn deserialize(data: []const u8) !UnconnectedPing {
+        var stream = BinaryStream{ .payload = @constCast(data), .written = data.len, .offset = 0, .allocator = undefined, .owns_buffer = false };
 
         _ = try stream.readUint8();
         const timestamp = try stream.readInt64(.Big);
         try Magic.read(&stream);
         const guid = try stream.readInt64(.Big);
 
-        return .{
-            .stream = stream,
-            .timestamp = timestamp,
-            .guid = guid,
-            .owns_stream = true,
-        };
+        return .{ .timestamp = timestamp, .guid = guid };
     }
 };
 
 test "Unconnected Ping" {
-    const allocator = std.heap.page_allocator;
-    var ping = UnconnectedPing.init(123456789, 987654321, allocator);
+    var ping = UnconnectedPing.init(123456789, 987654321);
 
-    const serialized = try ping.serialize();
+    var buf: [UnconnectedPing.MAX_SERIALIZED_SIZE]u8 = undefined;
+    const serialized = try ping.serializeInto(&buf);
 
-    var deserialized = try UnconnectedPing.deserialize(serialized, allocator);
+    var deserialized = try UnconnectedPing.deserialize(serialized);
     defer deserialized.deinit();
-    ping.deinit();
 
     try std.testing.expectEqual(ping.timestamp, deserialized.timestamp);
     try std.testing.expectEqual(ping.guid, deserialized.guid);
-    Logger.DEBUG("UnconnectedPing pass.", .{});
 }

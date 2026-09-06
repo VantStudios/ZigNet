@@ -31,23 +31,27 @@ pub const Frame = struct {
         };
     }
 
-    pub fn deinit(self: *const Frame, allocator: std.mem.Allocator) void {
-        // Only free if frame owns its payload (allocator was set during init)
-        if (self.allocator == null) return;
-        if (self.payload.len == 0) return;
-        allocator.free(self.payload);
+    /// Safe to call twice.
+    pub fn deinit(self: *Frame) void {
+        if (self.allocator) |alloc| {
+            if (self.payload.len > 0) {
+                alloc.free(self.payload);
+            }
+            self.payload = &.{};
+            self.allocator = null;
+        }
     }
 
     pub fn read(stream: *BinaryStream) !Frame {
         const flags = try stream.readUint8();
         const reliability: Reliability = @as(Reliability, @enumFromInt((flags & 224) >> 5));
         const length = try stream.readUint16(.Big);
-        const payload_length = (length + 7) / 8;
+        // widen: length + 7 overflows u16
+        const payload_length = (@as(u32, length) + 7) / 8;
         const split = (flags & @intFromEnum(Flags.Split)) != 0;
 
         if (payload_length + stream.offset > stream.written) {
-            std.debug.print("Frame length exceeds stream length: {d} > {d}\n", .{ payload_length + stream.offset, stream.written });
-            @panic("Frame length exceeds stream length");
+            return error.FrameLengthExceedsStream;
         }
 
         var reliable_frame_index: ?u32 = null;
@@ -158,3 +162,21 @@ pub const Frame = struct {
             (if (self.isSplit()) @as(usize, 10) else 0);
     }
 };
+
+test "Frame rejects lengths beyond the stream instead of panicking" {
+    const allocator = std.testing.allocator;
+    const malformed = [_]u8{ 0x84, 0xFF, 0xFF, 0x00, 0x01 };
+    var stream = BinaryStream.init(allocator, &malformed, null);
+    defer stream.deinit();
+
+    try std.testing.expectError(error.FrameLengthExceedsStream, Frame.read(&stream));
+}
+
+test "Frame deinit is idempotent" {
+    const allocator = std.testing.allocator;
+    const payload = try allocator.dupe(u8, "owned payload");
+    var frame = Frame.init(0, null, null, 0, .Reliable, payload, null, null, null, allocator);
+    frame.deinit();
+    frame.deinit();
+    try std.testing.expectEqual(@as(usize, 0), frame.payload.len);
+}

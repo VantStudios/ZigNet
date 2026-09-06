@@ -4,48 +4,60 @@ const Magic = @import("../Magic.zig").Magic;
 const Int8 = @import("BinaryStream").Int8;
 const Packets = @import("../Packets.zig").Packets;
 const Server = @import("../../server/Server.zig");
-const Logger = @import("../../misc/Logger.zig").Logger;
 
 pub const ConnectionRequest1 = struct {
-    stream: BinaryStream,
     protocol: u16,
     mtu_size: u16,
-    owns_stream: bool,
 
-    pub fn init(protocol: u16, mtu_size: u16, allocator: std.mem.Allocator) ConnectionRequest1 {
+    pub fn init(protocol: u16, mtu_size: u16) ConnectionRequest1 {
         return .{
-            .stream = BinaryStream.init(allocator, null, null),
             .protocol = protocol,
             .mtu_size = mtu_size,
-            .owns_stream = false,
         };
     }
 
     pub fn deinit(self: *ConnectionRequest1) void {
-        self.stream.deinit();
+        _ = self;
     }
 
-    pub fn serialize(self: *ConnectionRequest1, allocator: std.mem.Allocator) ![]const u8 {
-        try Int8.write(&self.stream, Packets.OpenConnectionRequest1);
-        try Magic.write(&self.stream);
-        try self.stream.writeUint8(@as(u8, @intCast(self.protocol)));
-        const current_size = @as(u16, @intCast(self.stream.written));
-        const padding_size = self.mtu_size - Server.UDP_HEADER_SIZE - current_size;
-        const zeros = try allocator.alloc(u8, padding_size);
-        defer allocator.free(zeros);
-        @memset(zeros, 0);
-        try self.stream.write(zeros);
-        return self.stream.getBuffer();
+    /// Zero-pads `out` (the MTU probe); returns the full slice.
+    pub fn serializeInto(self: *const ConnectionRequest1, out: []u8) ![]const u8 {
+        var s = BinaryStream{
+            .payload = out,
+            .written = 0,
+            .offset = 0,
+            .allocator = undefined,
+            .owns_buffer = false,
+        };
+
+        try Int8.write(&s, Packets.OpenConnectionRequest1);
+        try Magic.write(&s);
+        try s.writeUint8(@as(u8, @intCast(self.protocol)));
+
+        if (out.len < s.written) return error.MtuTooSmall;
+
+        @memset(out[s.written..], 0);
+        s.written = out.len;
+        return s.getBuffer();
     }
 
-    pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectionRequest1 {
-        var stream = BinaryStream.init(allocator, data, null);
+    /// Allocating wrapper; caller owns the result.
+    pub fn serialize(self: *const ConnectionRequest1, allocator: std.mem.Allocator) ![]const u8 {
+        const size = self.mtu_size - Server.UDP_HEADER_SIZE;
+        const buffer = try allocator.alloc(u8, size);
+        defer allocator.free(buffer);
+        return allocator.dupe(u8, try self.serializeInto(buffer));
+    }
+
+    pub fn deserialize(data: []const u8) !ConnectionRequest1 {
+        var stream = BinaryStream{ .payload = @constCast(data), .written = data.len, .offset = 0, .allocator = undefined, .owns_buffer = false };
         errdefer stream.deinit();
 
         _ = try Int8.read(&stream);
         try Magic.read(&stream);
         const protocol = try stream.readUint8();
-        var mtu_size = @as(u16, @intCast(stream.getBuffer().len));
+        // The MTU is inferred from the datagram size (RakNet convention).
+        var mtu_size: u16 = @intCast(stream.getBuffer().len);
         if (mtu_size + Server.UDP_HEADER_SIZE <= Server.MAX_MTU_SIZE) {
             mtu_size = mtu_size + Server.UDP_HEADER_SIZE;
         } else {
@@ -53,25 +65,22 @@ pub const ConnectionRequest1 = struct {
         }
 
         return .{
-            .stream = stream,
             .protocol = protocol,
             .mtu_size = mtu_size,
-            .owns_stream = true,
         };
     }
 };
 
 test "ConnectionRequest1" {
-    const allocator = std.heap.page_allocator;
-    var connection_request1 = ConnectionRequest1.init(11, 1400, allocator);
+    var connection_request1 = ConnectionRequest1.init(11, 1400);
 
-    const serialized = try connection_request1.serialize(allocator);
+    var buf: [1400 - 28]u8 = undefined;
+    const serialized = try connection_request1.serializeInto(&buf);
+    try std.testing.expectEqual(@as(usize, 1400 - 28), serialized.len);
 
-    var deserialized = try ConnectionRequest1.deserialize(serialized, allocator);
+    var deserialized = try ConnectionRequest1.deserialize(serialized);
     defer deserialized.deinit();
-    connection_request1.deinit();
 
     try std.testing.expectEqual(connection_request1.protocol, deserialized.protocol);
     try std.testing.expectEqual(connection_request1.mtu_size, deserialized.mtu_size);
-    Logger.DEBUG("ConnectionRequest1 pass.", .{});
 }

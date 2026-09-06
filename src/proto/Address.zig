@@ -10,58 +10,20 @@ pub const Address = struct {
     version: u8,
     address: []const u8,
     port: u16,
+    owned: bool = false, // deinit frees `address` only when true
 
     pub fn init(version: u8, address: []const u8, port: u16) Address {
-        return .{ .version = version, .address = address, .port = port };
+        return .{ .version = version, .address = address, .port = port, .owned = false };
     }
 
-    pub fn initFromRawBuiltin(raw_addr: *const anyopaque, port: u16, family: u8, allocator: std.mem.Allocator) !Address {
-        var buf: [48]u8 = undefined;
-        var ip_str: []const u8 = undefined;
-        var version: u8 = undefined;
+    pub fn initOwned(version: u8, address: []const u8, port: u16) Address {
+        return .{ .version = version, .address = address, .port = port, .owned = true };
+    }
 
-        switch (family) {
-            2, 4 => { // AF_INET
-                const ipv4_bytes = @as(*const [4]u8, @ptrCast(raw_addr));
-                ip_str = std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{
-                    ipv4_bytes[0],
-                    ipv4_bytes[1],
-                    ipv4_bytes[2],
-                    ipv4_bytes[3],
-                }) catch return AddressError.InvalidAddress;
-                version = 4;
-            },
-            6, 10 => { // AF_INET6
-                const ipv6_bytes = @as(*const [16]u8, @ptrCast(raw_addr));
-                // Format as IPv6 hex groups
-                ip_str = std.fmt.bufPrint(&buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
-                    ipv6_bytes[0],
-                    ipv6_bytes[1],
-                    ipv6_bytes[2],
-                    ipv6_bytes[3],
-                    ipv6_bytes[4],
-                    ipv6_bytes[5],
-                    ipv6_bytes[6],
-                    ipv6_bytes[7],
-                    ipv6_bytes[8],
-                    ipv6_bytes[9],
-                    ipv6_bytes[10],
-                    ipv6_bytes[11],
-                    ipv6_bytes[12],
-                    ipv6_bytes[13],
-                    ipv6_bytes[14],
-                    ipv6_bytes[15],
-                }) catch return AddressError.InvalidAddress;
-                version = 6;
-            },
-            else => {
-                std.log.err("Unsupported address family: {d}", .{family});
-                return AddressError.InvalidAddressVersion;
-            },
+    pub fn deinit(self: Address, allocator: std.mem.Allocator) void {
+        if (self.owned) {
+            allocator.free(self.address);
         }
-
-        const owned_address = try allocator.dupe(u8, ip_str);
-        return init(version, owned_address, port);
     }
 
     fn parseIPv4(address: []const u8) ![4]u8 {
@@ -139,50 +101,63 @@ pub const Address = struct {
         }
     }
 
-    pub fn write(self: Address, allocator: std.mem.Allocator) ![]u8 {
-        var buffer_size: usize = undefined;
-        if (self.version == 4) {
-            buffer_size = 1 + 4 + 2; // version + 4 IPv4 bytes + port
-        } else if (self.version == 6) {
-            buffer_size = 1 + 2 + 2 + 4 + 16 + 4; // version + header + port + padding + 16 IPv6 bytes + padding
-        } else {
-            return AddressError.InvalidAddressVersion;
-        }
+    pub fn wireSize(self: Address) !usize {
+        return switch (self.version) {
+            4 => 1 + 4 + 2,
+            6 => 1 + 2 + 2 + 4 + 16 + 4,
+            else => AddressError.InvalidAddressVersion,
+        };
+    }
 
-        var buffer = try allocator.alloc(u8, buffer_size);
+    /// Encodes into `out`; returns a slice of it.
+    pub fn writeTo(self: Address, out: []u8) ![]const u8 {
         var pos: usize = 0;
-
-        buffer[pos] = self.version;
-        pos += 1;
 
         switch (self.version) {
             4 => {
+                if (out.len < 1 + 4 + 2) return AddressError.InvalidAddress;
+                out[pos] = self.version;
+                pos += 1;
                 const ipv4_bytes = try parseIPv4(self.address);
                 for (ipv4_bytes) |byte| {
-                    buffer[pos] = (~byte) & 0xff;
+                    out[pos] = (~byte) & 0xff;
                     pos += 1;
                 }
-                std.mem.writeInt(u16, buffer[pos..][0..2], self.port, .big);
+                std.mem.writeInt(u16, out[pos..][0..2], self.port, .big);
+                pos += 2;
             },
 
             6 => {
-                std.mem.writeInt(u16, buffer[pos..][0..2], 23, .big);
+                if (out.len < 1 + 2 + 2 + 4 + 16 + 4) return AddressError.InvalidAddress;
+                out[pos] = self.version;
+                pos += 1;
+                std.mem.writeInt(u16, out[pos..][0..2], 23, .big);
                 pos += 2;
-                std.mem.writeInt(u16, buffer[pos..][0..2], self.port, .big);
+                std.mem.writeInt(u16, out[pos..][0..2], self.port, .big);
                 pos += 2;
-                std.mem.writeInt(u32, buffer[pos..][0..4], 0, .big);
+                std.mem.writeInt(u32, out[pos..][0..4], 0, .big);
                 pos += 4;
 
                 const ipv6_bytes = try parseIPv6(self.address);
                 for (0..8) |i| {
                     const word = std.mem.readInt(u16, ipv6_bytes[i * 2 ..][0..2], .big);
-                    std.mem.writeInt(u16, buffer[pos..][0..2], word ^ 0xffff, .big);
+                    std.mem.writeInt(u16, out[pos..][0..2], word ^ 0xffff, .big);
                     pos += 2;
                 }
-                std.mem.writeInt(u32, buffer[pos..][0..4], 0, .big);
+                std.mem.writeInt(u32, out[pos..][0..4], 0, .big);
+                pos += 4;
             },
             else => return AddressError.InvalidAddressVersion,
         }
+        return out[0..pos];
+    }
+
+    /// Allocating wrapper; caller owns the result.
+    pub fn write(self: Address, allocator: std.mem.Allocator) ![]u8 {
+        const size = try self.wireSize();
+        const buffer = try allocator.alloc(u8, size);
+        errdefer allocator.free(buffer);
+        _ = try self.writeTo(buffer);
         return buffer;
     }
 
@@ -197,11 +172,7 @@ pub const Address = struct {
                 }
                 const port = try stream.readUint16(.Big);
                 const address_str = try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ ipv4_bytes[0], ipv4_bytes[1], ipv4_bytes[2], ipv4_bytes[3] });
-                return Address{
-                    .version = version,
-                    .port = port,
-                    .address = address_str,
-                };
+                return Address.initOwned(version, address_str, port);
             },
 
             6 => {
@@ -223,21 +194,18 @@ pub const Address = struct {
                     address_parts[4], address_parts[5], address_parts[6], address_parts[7],
                 });
 
-                return Address{
-                    .version = version,
-                    .port = port,
-                    .address = address_str,
-                };
+                return Address.initOwned(version, address_str, port);
             },
 
-            else => {
-                std.log.err("Invalid IP version: {d}", .{version});
-                return AddressError.InvalidAddressVersion;
-            },
+            else => return AddressError.InvalidAddressVersion,
         };
     }
-
-    pub fn deinit(self: Address, allocator: std.mem.Allocator) void {
-        allocator.free(self.address);
-    }
 };
+
+test "Address v4 write and deinit borrow semantics" {
+    const borrowed = Address.init(4, "127.0.0.1", 19132);
+    var buf: [16]u8 = undefined;
+    const encoded = try borrowed.writeTo(&buf);
+    try std.testing.expectEqual(@as(usize, 7), encoded.len);
+    borrowed.deinit(std.testing.allocator);
+}

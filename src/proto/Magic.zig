@@ -1,3 +1,4 @@
+const std = @import("std");
 const BinaryStream = @import("BinaryStream").BinaryStream;
 
 pub const MagicBytes: [16]u8 = [16]u8{
@@ -6,11 +7,28 @@ pub const MagicBytes: [16]u8 = [16]u8{
 };
 
 pub const Magic = struct {
+    pub const bytes = MagicBytes;
+
     pub fn read(stream: *BinaryStream) !void {
-        stream.offset += 16; // Skip 16 bytes
+        const got = stream.read(MagicBytes.len);
+        if (got.len != MagicBytes.len) return error.PacketTooShort;
+        if (!std.mem.eql(u8, got, &MagicBytes)) return error.InvalidMagic;
     }
 
     pub fn write(stream: *BinaryStream) !void {
         try stream.write(&MagicBytes);
     }
 };
+
+test "Magic read rejects invalid bytes" {
+    var bad: [20]u8 = undefined;
+    @memset(&bad, 0xAA);
+    var stream = BinaryStream{ .payload = &bad, .written = bad.len, .offset = 0, .allocator = undefined, .owns_buffer = false };
+    try std.testing.expectError(error.InvalidMagic, Magic.read(&stream));
+
+    var good: [20]u8 = undefined;
+    @memcpy(good[0..16], &MagicBytes);
+    @memset(good[16..], 0);
+    var stream2 = BinaryStream{ .payload = &good, .written = good.len, .offset = 0, .allocator = undefined, .owns_buffer = false };
+    try Magic.read(&stream2);
+}

@@ -2,7 +2,6 @@ const BinaryStream = @import("BinaryStream").BinaryStream;
 const Packets = @import("../Packets.zig").Packets;
 const Frame = @import("../Frame.zig").Frame;
 const std = @import("std");
-const Logger = @import("../../misc/Logger.zig").Logger;
 
 pub const FrameSet = struct {
     stream: BinaryStream,
@@ -28,6 +27,24 @@ pub const FrameSet = struct {
         }
 
         return self.stream.getBuffer();
+    }
+
+    /// Writes into `out` (zero allocs); returns a slice of it.
+    pub fn serializeInto(sequence_number: u24, frames: []const Frame, out: []u8) ![]const u8 {
+        var s = BinaryStream{
+            .payload = out,
+            .written = 0,
+            .offset = 0,
+            .allocator = undefined,
+            .owns_buffer = false,
+        };
+
+        try s.writeUint8(Packets.FrameSet);
+        try s.writeUint24(sequence_number, .Little);
+        for (frames) |frame| {
+            try frame.write(&s);
+        }
+        return s.getBuffer();
     }
 
     pub fn deserialize(buffer: []const u8, allocator: std.mem.Allocator) !FrameSet {
@@ -85,14 +102,35 @@ test "FrameSet" {
 
     const serialized = try frameset.serialize();
 
+    // deserialized payloads borrow from frameset.stream: it must outlive them
     var deserialized = try FrameSet.deserialize(serialized, allocator);
     defer deserialized.deinit(allocator);
-    frameset.deinit(allocator);
 
     try std.testing.expectEqual(@as(u24, 42), deserialized.sequence_number);
     try std.testing.expectEqual(frames.len, deserialized.frames.len);
     try std.testing.expectEqual(frames[0].reliability, deserialized.frames[0].reliability);
     try std.testing.expectEqual(frames[0].reliable_frame_index, deserialized.frames[0].reliable_frame_index);
     try std.testing.expectEqualSlices(u8, frames[0].payload, deserialized.frames[0].payload);
-    Logger.DEBUG("FrameSet pass.", .{});
+
+    frameset.deinit(allocator);
+}
+
+test "FrameSet serializeInto writes into the caller buffer" {
+    const allocator = std.testing.allocator;
+
+    const test_payload = try allocator.dupe(u8, "Hello, World!");
+    defer allocator.free(test_payload);
+
+    const frame = Frame.init(7, null, null, null, .Reliable, test_payload, null, null, null, null);
+    const frames = [_]Frame{frame};
+
+    var buffer: [256]u8 = undefined;
+    const serialized = try FrameSet.serializeInto(42, &frames, &buffer);
+
+    var deserialized = try FrameSet.deserialize(serialized, allocator);
+    defer deserialized.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u24, 42), deserialized.sequence_number);
+    try std.testing.expectEqual(@as(usize, 1), deserialized.frames.len);
+    try std.testing.expectEqualSlices(u8, test_payload, deserialized.frames[0].payload);
 }

@@ -3,72 +3,76 @@ const Packets = @import("../Packets.zig").Packets;
 const BinaryStream = @import("BinaryStream").BinaryStream;
 const Magic = @import("../Magic.zig").Magic;
 
-/// Global variable to track if the server has security enabled (for libcat usage)
-pub var server_has_security: bool = false;
-
 pub const ConnectionReply1 = struct {
-    stream: BinaryStream,
+    pub const MAX_SERIALIZED_SIZE = 28; // id(1) + magic(16) + guid(8) + hasSecurity(1) + mtu(2)
     guid: i64,
     hasSecurity: bool,
     mtu_size: u16,
     has_cookie: bool = false,
     cookie: ?u32 = null,
     server_public_key: ?[294]u8 = null,
-    owns_stream: bool,
 
-    pub fn init(guid: i64, hasSecurity: bool, mtu_size: u16, allocator: std.mem.Allocator) ConnectionReply1 {
+    pub fn init(guid: i64, hasSecurity: bool, mtu_size: u16) ConnectionReply1 {
         return .{
-            .stream = BinaryStream.init(allocator, null, null),
             .guid = guid,
             .hasSecurity = hasSecurity,
             .mtu_size = mtu_size,
-            .owns_stream = false,
         };
     }
 
-    pub fn initWithSecurity(guid: i64, mtu_size: u16, has_cookie: bool, cookie: u32, server_public_key: ?[294]u8, allocator: std.mem.Allocator) ConnectionReply1 {
+    pub fn initWithSecurity(guid: i64, mtu_size: u16, has_cookie: bool, cookie: u32, server_public_key: ?[294]u8) ConnectionReply1 {
         return .{
-            .stream = BinaryStream.init(allocator, null, null),
             .guid = guid,
             .hasSecurity = true,
             .mtu_size = mtu_size,
             .has_cookie = has_cookie,
             .cookie = cookie,
             .server_public_key = server_public_key,
-            .owns_stream = false,
         };
     }
 
     pub fn deinit(self: *ConnectionReply1) void {
-        self.stream.deinit();
+        _ = self;
     }
 
-    pub fn serialize(self: *ConnectionReply1) ![]const u8 {
-        try self.stream.writeUint8(Packets.OpenConnectionReply1);
-        try Magic.write(&self.stream);
-        try self.stream.writeInt64(self.guid, .Big);
-        try self.stream.writeBool(self.hasSecurity);
-        try self.stream.writeUint16(self.mtu_size, .Big);
-        return self.stream.getBuffer();
+    /// Writes into `out` (zero allocs); returns a slice of it.
+    /// The security extension (cookie + public key) is not written yet; the
+    /// server never enables it today.
+    pub fn serializeInto(self: *const ConnectionReply1, out: []u8) ![]const u8 {
+        var s = BinaryStream{
+            .payload = out,
+            .written = 0,
+            .offset = 0,
+            .allocator = undefined,
+            .owns_buffer = false,
+        };
+
+        try s.writeUint8(Packets.OpenConnectionReply1);
+        try Magic.write(&s);
+        try s.writeInt64(self.guid, .Big);
+        try s.writeBool(self.hasSecurity);
+        try s.writeUint16(self.mtu_size, .Big);
+        return s.getBuffer();
     }
 
-    pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectionReply1 {
-        var stream = BinaryStream.init(allocator, data, null);
-        errdefer stream.deinit();
+    /// Allocating wrapper; caller owns the result.
+    pub fn serialize(self: *const ConnectionReply1, allocator: std.mem.Allocator) ![]const u8 {
+        var buf: [ConnectionReply1.MAX_SERIALIZED_SIZE]u8 = undefined;
+        return allocator.dupe(u8, try self.serializeInto(&buf));
+    }
+
+    pub fn deserialize(data: []const u8) !ConnectionReply1 {
+        var stream = BinaryStream{ .payload = @constCast(data), .written = data.len, .offset = 0, .allocator = undefined, .owns_buffer = false };
 
         _ = try stream.readUint8();
         try Magic.read(&stream);
         const guid = try stream.readInt64(.Big);
         const hasSecurity = try stream.readBool();
 
-        server_has_security = hasSecurity;
-
         var result = ConnectionReply1{
-            .stream = stream,
             .guid = guid,
             .hasSecurity = hasSecurity,
             .mtu_size = 0,
-            .owns_stream = true,
         };
 
         if (hasSecurity) {
@@ -92,14 +96,13 @@ pub const ConnectionReply1 = struct {
 };
 
 test "ConnectionReply1" {
-    const allocator = std.heap.page_allocator;
-    var connection_reply1 = ConnectionReply1.init(123456789, true, 1492, allocator);
+    var connection_reply1 = ConnectionReply1.init(123456789, true, 1492);
 
-    const serialized = try connection_reply1.serialize();
+    var buf: [ConnectionReply1.MAX_SERIALIZED_SIZE]u8 = undefined;
+    const serialized = try connection_reply1.serializeInto(&buf);
 
-    var deserialized = try ConnectionReply1.deserialize(serialized, allocator);
+    var deserialized = try ConnectionReply1.deserialize(serialized);
     defer deserialized.deinit();
-    connection_reply1.deinit();
 
     try std.testing.expectEqual(connection_reply1.guid, deserialized.guid);
     try std.testing.expectEqual(connection_reply1.hasSecurity, deserialized.hasSecurity);

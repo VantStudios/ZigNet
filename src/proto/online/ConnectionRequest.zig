@@ -1,68 +1,66 @@
 const std = @import("std");
 const BinaryStream = @import("BinaryStream").BinaryStream;
 const Packets = @import("../Packets.zig").Packets;
-const Logger = @import("../../misc/Logger.zig").Logger;
 
 pub const ConnectionRequest = struct {
-    stream: BinaryStream,
+    pub const MAX_SERIALIZED_SIZE = 18; // id(1) + guid(8) + timestamp(8) + security(1)
     guid: i64,
     timestamp: i64,
     use_security: bool,
-    owns_stream: bool,
 
-    pub fn init(guid: i64, timestamp: i64, use_security: bool, allocator: std.mem.Allocator) ConnectionRequest {
-        return .{
-            .stream = BinaryStream.init(allocator, null, null),
-            .guid = guid,
-            .timestamp = timestamp,
-            .use_security = use_security,
-            .owns_stream = false,
-        };
+    pub fn init(guid: i64, timestamp: i64, use_security: bool) ConnectionRequest {
+        return .{ .guid = guid, .timestamp = timestamp, .use_security = use_security };
     }
 
     pub fn deinit(self: *ConnectionRequest) void {
-        self.stream.deinit();
+        _ = self;
     }
 
-    pub fn serialize(self: *ConnectionRequest) ![]const u8 {
-        try self.stream.writeUint8(Packets.ConnectionRequest);
-        try self.stream.writeInt64(self.guid, .Big);
-        try self.stream.writeInt64(self.timestamp, .Big);
-        try self.stream.writeBool(self.use_security);
-        return self.stream.getBuffer();
+    /// Writes into `out` (zero allocs); returns a slice of it.
+    pub fn serializeInto(self: *const ConnectionRequest, out: []u8) ![]const u8 {
+        var s = BinaryStream{
+            .payload = out,
+            .written = 0,
+            .offset = 0,
+            .allocator = undefined,
+            .owns_buffer = false,
+        };
+
+        try s.writeUint8(Packets.ConnectionRequest);
+        try s.writeInt64(self.guid, .Big);
+        try s.writeInt64(self.timestamp, .Big);
+        try s.writeBool(self.use_security);
+        return s.getBuffer();
     }
 
-    pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !ConnectionRequest {
-        var stream = BinaryStream.init(allocator, data, null);
-        errdefer stream.deinit();
+    /// Allocating wrapper; caller owns the result.
+    pub fn serialize(self: *const ConnectionRequest, allocator: std.mem.Allocator) ![]const u8 {
+        var buf: [ConnectionRequest.MAX_SERIALIZED_SIZE]u8 = undefined;
+        return allocator.dupe(u8, try self.serializeInto(&buf));
+    }
+
+    pub fn deserialize(data: []const u8) !ConnectionRequest {
+        var stream = BinaryStream{ .payload = @constCast(data), .written = data.len, .offset = 0, .allocator = undefined, .owns_buffer = false };
 
         _ = try stream.readUint8();
         const guid = try stream.readInt64(.Big);
         const timestamp = try stream.readInt64(.Big);
         const use_security = try stream.readBool();
 
-        return .{
-            .stream = stream,
-            .guid = guid,
-            .timestamp = timestamp,
-            .use_security = use_security,
-            .owns_stream = true,
-        };
+        return .{ .guid = guid, .timestamp = timestamp, .use_security = use_security };
     }
 };
 
 test "ConnectionRequest" {
-    const allocator = std.heap.page_allocator;
-    var connection_request = ConnectionRequest.init(123456789, 987654321, true, allocator);
+    var request = ConnectionRequest.init(123456789, 987654321, true);
 
-    const serialized = try connection_request.serialize();
+    var buf: [ConnectionRequest.MAX_SERIALIZED_SIZE]u8 = undefined;
+    const serialized = try request.serializeInto(&buf);
 
-    var deserialized = try ConnectionRequest.deserialize(serialized, allocator);
+    var deserialized = try ConnectionRequest.deserialize(serialized);
     defer deserialized.deinit();
-    connection_request.deinit();
 
-    try std.testing.expectEqual(connection_request.guid, deserialized.guid);
-    try std.testing.expectEqual(connection_request.timestamp, deserialized.timestamp);
-    try std.testing.expectEqual(connection_request.use_security, deserialized.use_security);
-    Logger.DEBUG("ConnectionRequest pass.", .{});
+    try std.testing.expectEqual(request.guid, deserialized.guid);
+    try std.testing.expectEqual(request.timestamp, deserialized.timestamp);
+    try std.testing.expectEqual(request.use_security, deserialized.use_security);
 }
