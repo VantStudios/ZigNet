@@ -239,6 +239,9 @@ pub const Socket = struct {
                     .success => |packet_info| {
                         self.consecutive_errors.store(0, .release);
                         if (packet_info) |info| {
+                            if (builtin.os.tag == .windows) {
+                                if (self.should_stop.load(.acquire)) return;
+                            }
                             self.handlePacket(@constCast(info.data), info.from_addr);
                             packets_processed += 1;
                         }
@@ -280,14 +283,7 @@ pub const Socket = struct {
     };
 
     fn receivePacket(self: *Self, buffer: []u8) ReceiveResult {
-        const timeout: std.Io.Timeout = .{
-            .duration = .{
-                .raw = std.Io.Duration.fromNanoseconds(Config.SOCKET_RECV_TIMEOUT_MS * std.time.ns_per_ms),
-                .clock = .awake,
-            },
-        };
-
-        const msg = self._socket.receiveTimeout(self.io, buffer, timeout) catch |err| switch (err) {
+        const msg = self.receiveMessage(buffer) catch |err| switch (err) {
             error.Timeout => return .{ .would_block = {} },
             error.Canceled => return .{ .error_fatal = err },
             // transient (EINTR, ENOBUFS, ...): back off and keep receiving
@@ -306,10 +302,41 @@ pub const Socket = struct {
         return .{ .success = .{ .data = buffer[0..msg.data.len], .from_addr = msg.from } };
     }
 
+    fn receiveMessage(self: *Self, buffer: []u8) net.Socket.ReceiveTimeoutError!net.IncomingMessage {
+        if (builtin.os.tag == .windows) return self._socket.receive(self.io, buffer);
+
+        const timeout: std.Io.Timeout = .{
+            .duration = .{
+                .raw = std.Io.Duration.fromNanoseconds(Config.SOCKET_RECV_TIMEOUT_MS * std.time.ns_per_ms),
+                .clock = .awake,
+            },
+        };
+        return self._socket.receiveTimeout(self.io, buffer, timeout);
+    }
+
+    fn wakeReceiveLoop(self: *Self) void {
+        var addr = self._socket.address;
+        switch (addr) {
+            .ip4 => |ip4| {
+                if (std.mem.allEqual(u8, &ip4.bytes, 0)) addr = .{ .ip4 = net.Ip4Address.loopback(ip4.port) };
+            },
+            .ip6 => |ip6| {
+                if (std.mem.allEqual(u8, &ip6.bytes, 0)) {
+                    addr = net.IpAddress.parseIp6("::1", ip6.port) catch return;
+                }
+            },
+        }
+        self.send(&[_]u8{0}, addr) catch {};
+    }
+
     pub fn stop(self: *Self) void {
         if (!self.is_listening.load(.acquire)) return;
 
         self.should_stop.store(true, .release);
+
+        if (builtin.os.tag == .windows) {
+            if (self.thread != null) self.wakeReceiveLoop();
+        }
 
         if (self.thread) |thread| {
             thread.join();
