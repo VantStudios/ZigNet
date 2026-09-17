@@ -21,7 +21,8 @@ const MAX_RETRANSMITS_PER_TICK: usize = 32;
 // 3 + 384*4 = 1539: worst-case ACK datagram; a bigger batch would fail to
 // serialize every tick and never ack.
 const MAX_ACK_BATCH: usize = 384;
-const MAX_FRAMES_PER_TICK: usize = 128;
+const MAX_FRAMES_PER_TICK: usize = 512;
+const MAX_SEND_NS: i64 = 5 * std.time.ns_per_ms;
 const DATAGRAM_SCRATCH_SIZE = 1600;
 
 comptime {
@@ -70,6 +71,7 @@ pub const Connection = struct {
     send_mutex: std.Io.Mutex = .init,
     pending_connect_event: bool = false,
     send_scratch: [DATAGRAM_SCRATCH_SIZE]u8 = undefined,
+    pending_movement: ?[]u8 = null,
 
     pub fn init(server: *Server, address: std.Io.net.IpAddress, mtu_size: u16, guid: i64) Self {
         return Self{
@@ -102,6 +104,10 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.pending_movement) |pending| {
+            self.server.options.allocator.free(pending);
+            self.pending_movement = null;
+        }
         self.comm_data.deinit(self.server.options.allocator);
     }
 
@@ -211,10 +217,10 @@ pub const Connection = struct {
             return;
         }
 
-        const allocator = self.server.options.allocator;
         const now = Timestamp.now(self.server.io, .awake);
 
         self.purgeStaleFragments(now);
+        self.flushPendingMovement();
 
         self.send_mutex.lock(self.server.io) catch |err| {
             Logger.WARN("mutex lock failed: {}", .{err});
@@ -222,7 +228,7 @@ pub const Connection = struct {
         };
 
         if (self.queuedFrameCount() > 0) {
-            self.sendQueueLocked(MAX_FRAMES_PER_TICK);
+            self.sendQueueLocked(MAX_FRAMES_PER_TICK, MAX_SEND_NS);
         }
 
         self.retransmitTimedOut(now);
@@ -230,56 +236,44 @@ pub const Connection = struct {
         self.send_mutex.unlock(self.server.io);
 
         if (self.comm_data.received_sequences.count() > 0) {
-            var sequences_list = std.ArrayList(u32).empty;
-            defer sequences_list.deinit(allocator);
-
+            var batch_storage: [MAX_ACK_BATCH]u32 = undefined;
+            var batch_len: usize = 0;
             var iter = self.comm_data.received_sequences.keyIterator();
             while (iter.next()) |key| {
-                sequences_list.append(allocator, key.*) catch continue;
+                if (batch_len == batch_storage.len) break;
+                batch_storage[batch_len] = key.*;
+                batch_len += 1;
             }
-
-            if (sequences_list.items.len > 0) {
-                std.mem.sort(u32, sequences_list.items, {}, comptime std.sort.asc(u32));
-
-                const batch = sequences_list.items[0..@min(sequences_list.items.len, MAX_ACK_BATCH)];
-
+            if (batch_len > 0) {
+                const batch = batch_storage[0..batch_len];
+                std.mem.sort(u32, batch, {}, comptime std.sort.asc(u32));
                 var ack_buf: [DATAGRAM_SCRATCH_SIZE]u8 = undefined;
                 const serialized = Proto.Ack.serializeInto(batch, Proto.Packets.Ack, &ack_buf) catch |err| {
                     Logger.ERROR("Failed to serialize ack: {any}", .{err});
                     return;
                 };
-
-                for (batch) |seq| {
-                    _ = self.comm_data.received_sequences.remove(@truncate(seq));
-                }
-
+                for (batch) |seq| _ = self.comm_data.received_sequences.remove(@truncate(seq));
                 self.send(serialized);
             }
         }
         if (self.comm_data.lost_sequences.count() > 0) {
-            var sequences_list = std.ArrayList(u32).empty;
-            defer sequences_list.deinit(allocator);
-
+            var batch_storage: [MAX_ACK_BATCH]u32 = undefined;
+            var batch_len: usize = 0;
             var iter = self.comm_data.lost_sequences.keyIterator();
             while (iter.next()) |key| {
-                sequences_list.append(allocator, key.*) catch continue;
+                if (batch_len == batch_storage.len) break;
+                batch_storage[batch_len] = key.*;
+                batch_len += 1;
             }
-
-            if (sequences_list.items.len > 0) {
-                std.mem.sort(u32, sequences_list.items, {}, comptime std.sort.asc(u32));
-
-                const batch = sequences_list.items[0..@min(sequences_list.items.len, MAX_ACK_BATCH)];
-
+            if (batch_len > 0) {
+                const batch = batch_storage[0..batch_len];
+                std.mem.sort(u32, batch, {}, comptime std.sort.asc(u32));
                 var nack_buf: [DATAGRAM_SCRATCH_SIZE]u8 = undefined;
                 const serialized = Proto.Ack.serializeInto(batch, Proto.Packets.Nack, &nack_buf) catch |err| {
                     Logger.ERROR("Failed to serialize nack: {any}", .{err});
                     return;
                 };
-
-                for (batch) |seq| {
-                    _ = self.comm_data.lost_sequences.remove(@truncate(seq));
-                }
-
+                for (batch) |seq| _ = self.comm_data.lost_sequences.remove(@truncate(seq));
                 self.send(serialized);
             }
         }
@@ -760,7 +754,6 @@ pub const Connection = struct {
     }
 
     pub fn sendReliableMessage(self: *Connection, msg: []const u8, priority: Priority) void {
-        // Don't create frames for inactive connections - this prevents memory leaks
         if (!self.active) return;
 
         var frame = frameIn(msg, self.server.options.allocator) catch |err| {
@@ -770,6 +763,39 @@ pub const Connection = struct {
         frame.reliability = Reliability.ReliableOrdered;
 
         self.sendFrame(frame, priority);
+    }
+
+    pub fn sendMovementReliableMessage(self: *Connection, msg: []const u8) void {
+        if (!self.active) return;
+        const allocator = self.server.options.allocator;
+        const copy = allocator.dupe(u8, msg) catch {
+            self.comm_data.movement_dropped += 1;
+            return;
+        };
+        self.send_mutex.lock(self.server.io) catch {
+            allocator.free(copy);
+            self.comm_data.movement_dropped += 1;
+            return;
+        };
+        if (self.pending_movement) |previous| {
+            allocator.free(previous);
+            self.comm_data.movement_coalesced += 1;
+        }
+        self.pending_movement = copy;
+        self.send_mutex.unlock(self.server.io);
+    }
+
+    fn flushPendingMovement(self: *Connection) void {
+        self.send_mutex.lock(self.server.io) catch return;
+        const pending = self.pending_movement orelse {
+            self.send_mutex.unlock(self.server.io);
+            return;
+        };
+        self.pending_movement = null;
+        self.send_mutex.unlock(self.server.io);
+
+        const frame = Frame.init(null, null, null, 0, Reliability.ReliableOrdered, pending, null, null, null, self.server.options.allocator);
+        self.sendFrame(frame, .Normal);
     }
 
     pub fn sendFrame(self: *Connection, frame: Frame, priority: Priority) void {
@@ -890,10 +916,12 @@ pub const Connection = struct {
             f.deinit();
             return;
         };
+        self.comm_data.output_frames_queued += 1;
+        self.comm_data.output_queue_peak = @max(self.comm_data.output_queue_peak, self.queuedFrameCount());
 
         const should_send_immediately = priority == Priority.Immediate;
         if (should_send_immediately) {
-            self.sendQueueLocked(self.queuedFrameCount());
+            self.sendQueueLocked(self.queuedFrameCount(), 0);
         }
 
         if (start_time) |start| {
@@ -923,15 +951,20 @@ pub const Connection = struct {
     }
 
     // caller holds send_mutex
-    fn sendQueueLocked(self: *Connection, amount: usize) void {
+    fn sendQueueLocked(self: *Connection, amount: usize, budget_ns: i64) void {
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
         const allocator = self.server.options.allocator;
         const now = Timestamp.now(self.server.io, .awake);
+        const budget_started = now;
 
         const max_frameset_size = self.mtu_size - 28; // Leave room for UDP/IP headers
 
         var processed: usize = 0;
         while (processed < amount) {
+            if (budget_ns > 0 and processed > 0) {
+                const elapsed_ns = budget_started.untilNow(self.server.io, .awake).nanoseconds;
+                if (elapsed_ns >= budget_ns) break;
+            }
             const available = self.queuedFrameCount();
             if (available == 0) break;
 
@@ -986,6 +1019,7 @@ pub const Connection = struct {
             };
 
             self.send(serialized);
+            self.comm_data.output_frames_sent += fit;
 
             for (frames) |*frame| frame.deinit();
             self.advanceQueueHead(fit);
@@ -1098,6 +1132,9 @@ pub const CommData = struct {
     output_sequence: u32,
     output_frame_queue: std.ArrayList(Frame),
     output_queue_head: usize = 0,
+    output_frames_queued: u64 = 0,
+    output_frames_sent: u64 = 0,
+    output_queue_peak: usize = 0,
     output_backup: std.AutoHashMap(u24, BackupEntry),
     output_order_index: [MAX_CHANNELS]u32,
     output_sequence_index: [MAX_CHANNELS]u32,
@@ -1105,6 +1142,8 @@ pub const CommData = struct {
 
     fragments_queue: std.AutoHashMap(u16, FragmentSet),
     fragments_activity: std.AutoHashMap(u16, Timestamp),
+    movement_coalesced: u64 = 0,
+    movement_dropped: u64 = 0,
 
     pub fn deinit(self: *CommData, allocator: std.mem.Allocator) void {
         self.received_sequences.deinit();

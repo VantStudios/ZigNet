@@ -19,9 +19,10 @@ const Proto = @import("../proto/root.zig");
 const Frame = Proto.Frame;
 const Reliability = Proto.Reliability;
 const Socket = @import("../socket/socket.zig").Socket;
+const Poller = @import("../socket/socket.zig").Poller;
 
 const MAX_CHANNELS = 32;
-const MAX_ORDERING_QUEUE_SIZE = 64;
+const MAX_ORDERING_QUEUE_SIZE = 4096;
 const MAX_SPLIT_SIZE: u32 = 1024;
 const MAX_FRAGMENT_SETS = 256;
 const MAX_LOST_GAP: u32 = 4096;
@@ -99,13 +100,16 @@ pub const Client = struct {
     pub fn connect(self: *Client) !void {
         // callback must be live before the recv thread starts
         self.socket.setCallback(Client._on, self);
-        try self.socket.listen();
+        if (self.options.receive_poller) |poller| self.socket.attachPoller(poller);
+        if (self.options.manual_tick) try self.socket.listenManual() else try self.socket.listen();
 
         self.status = .Connecting;
         self.connect_called = true;
         self.last_receive = Timestamp.now(self.options.io, .awake);
 
-        self.tick_thread = try std.Thread.spawn(.{}, tickLoop, .{self});
+        if (!self.options.manual_tick) {
+            self.tick_thread = try std.Thread.spawn(.{}, tickLoop, .{self});
+        }
         var request = OpenConnectionRequest1.init(11, self.options.mtu_size);
         defer request.deinit();
 
@@ -160,7 +164,6 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
     ) !void {
         _ = from_addr;
-        defer allocator.free(payload);
         if (payload.len == 0) return;
         var ID: u8 = payload[0];
         if (ID & 0xF0 == 0x80) ID = 0x80;
@@ -620,6 +623,7 @@ pub const Client = struct {
             return existing;
         }
         slot.* = ChannelQueue.init(self.options.allocator);
+        slot.*.?.ensureTotalCapacity(256) catch return null;
         return &(slot.*.?);
     }
 
@@ -949,6 +953,8 @@ pub const Client = struct {
     pub fn tick(self: *Client) void {
         if (self.status == .Disconnected or !self.connect_called) return;
 
+        if (self.options.manual_tick and self.options.receive_poller == null) self.socket.receiveOnce();
+
         // Only check for timeout after connect() has been called
         const now = Timestamp.now(self.options.io, .awake);
         const elapsed = self.last_receive.untilNow(self.options.io, .awake).toMilliseconds();
@@ -1045,6 +1051,8 @@ pub const ClientOptions = struct {
     mtu_size: u16 = 1492,
     guid: i64 = 0,
     tick_rate: u64 = 20,
+    manual_tick: bool = false,
+    receive_poller: ?*Poller = null,
 };
 
 pub const Status = enum {
@@ -1062,7 +1070,7 @@ pub const Priority = enum(u8) {
 const ChannelQueue = std.AutoHashMap(u32, Frame);
 const FragmentSet = std.AutoHashMap(u16, Frame);
 const MAX_PENDING_SEQUENCES = 8192;
-const MAX_FRAMES_PER_TICK: usize = 128;
+const MAX_FRAMES_PER_TICK: usize = 512;
 const FRAGMENT_TIMEOUT_NS: i64 = 10 * std.time.ns_per_s;
 // worst case 3 + 384*4 = 1539 fits the scratch buffer; bigger batches would
 // fail to serialize every tick and never ack

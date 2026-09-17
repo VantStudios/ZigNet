@@ -3,6 +3,7 @@ pub const ServerOptions = @import("./server/Server.zig").ServerOptions;
 pub const Connection = @import("./server/Connection.zig").Connection;
 
 pub const Socket = @import("./socket/socket.zig").Socket;
+pub const Poller = @import("./socket/socket.zig").Poller;
 pub const SocketCallbackFn = @import("./socket/socket.zig").CallbackFn;
 pub const SocketError = @import("./socket/socket.zig").SocketError;
 

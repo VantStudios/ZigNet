@@ -280,8 +280,6 @@ pub const Server = struct {
         const self = @as(*Self, @ptrCast(@alignCast(context)));
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.io, .awake) else null;
 
-        defer allocator.free(data);
-
         if (data.len == 0) return;
 
         var ID: u8 = data[0];

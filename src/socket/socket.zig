@@ -7,6 +7,44 @@ const builtin = @import("builtin");
 
 const Logger = @import("../misc/Logger.zig").Logger;
 
+pub const Poller = struct {
+    fd: i32,
+
+    pub fn init() !Poller {
+        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+        const raw = std.os.linux.epoll_create1(0);
+        if (raw > std.math.maxInt(i32)) return error.PollerInitFailed;
+        return .{ .fd = @intCast(raw) };
+    }
+
+    pub fn deinit(self: *Poller) void {
+        if (builtin.os.tag == .linux) _ = std.os.linux.close(self.fd);
+        self.fd = -1;
+    }
+
+    fn add(self: *Poller, socket: *Socket) !void {
+        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+        var event = std.os.linux.epoll_event{
+            .events = 1,
+            .data = .{ .ptr = @intFromPtr(socket) },
+        };
+        const result = std.os.linux.epoll_ctl(self.fd, 1, @intCast(socket._socket.handle), &event);
+        if (result != 0) return error.PollerAddFailed;
+    }
+
+    pub fn poll(self: *Poller) void {
+        if (builtin.os.tag != .linux) return;
+        var events: [512]std.os.linux.epoll_event = undefined;
+        const count = std.os.linux.epoll_wait(self.fd, &events, events.len, 0);
+        if (count > events.len) return;
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            const socket: *Socket = @ptrFromInt(events[index].data.ptr);
+            socket.receiveReady();
+        }
+    }
+};
+
 pub const SocketError = error{
     WinsockInitFailed,
     SocketCreationFailed,
@@ -55,6 +93,7 @@ pub const Socket = struct {
 
     // Error handling
     consecutive_errors: std.atomic.Value(u32),
+    poller: ?*Poller = null,
 
     // Platform-specific
     winsock_initialized: if (builtin.os.tag == .windows) bool else void,
@@ -128,19 +167,60 @@ pub const Socket = struct {
     }
 
     pub fn listen(self: *Self) SocketError!void {
-        if (self.is_listening.load(.acquire)) {
-            return SocketError.AlreadyListening;
-        }
+        return self.listenWithMode(false);
+    }
+
+    pub fn attachPoller(self: *Self, poller: *Poller) void {
+        self.poller = poller;
+    }
+
+    pub fn listenManual(self: *Self) SocketError!void {
+        return self.listenWithMode(true);
+    }
+
+    fn listenWithMode(self: *Self, manual: bool) SocketError!void {
+        if (self.is_listening.load(.acquire)) return SocketError.AlreadyListening;
 
         self.should_stop.store(false, .release);
         self.consecutive_errors.store(0, .release);
+        self.is_listening.store(true, .release);
+
+        if (manual) {
+            if (self.poller) |poller| {
+                poller.add(self) catch {
+                    self.is_listening.store(false, .release);
+                    return SocketError.BindFailed;
+                };
+            }
+            return;
+        }
 
         self.thread = Thread.spawn(.{}, receiveLoop, .{self}) catch |err| {
+            self.is_listening.store(false, .release);
             std.log.err("Failed to spawn receive thread: {any}", .{err});
             return SocketError.ThreadSpawnFailed;
         };
+    }
 
-        self.is_listening.store(true, .release);
+    pub fn receiveOnce(self: *Self) void {
+        self.receiveReady();
+    }
+
+    fn receiveReady(self: *Self) void {
+        if (!self.is_listening.load(.acquire)) return;
+        var buffer: [Config.BUFFER_SIZE]u8 = undefined;
+        const timeout: std.Io.Timeout = .{
+            .duration = .{
+                .raw = .fromNanoseconds(0),
+                .clock = .awake,
+            },
+        };
+        const result = self._socket.receiveTimeout(self.io, &buffer, timeout) catch |err| switch (err) {
+            error.Timeout => return,
+            else => return,
+        };
+        if (result.data.len == 0) return;
+        self.handlePacket(@constCast(result.data), result.from);
     }
 
     // recv with a timeout already yields the CPU; extra sleeps add latency
@@ -159,7 +239,7 @@ pub const Socket = struct {
                     .success => |packet_info| {
                         self.consecutive_errors.store(0, .release);
                         if (packet_info) |info| {
-                            self.handlePacket(info.data, info.from_addr);
+                            self.handlePacket(@constCast(info.data), info.from_addr);
                             packets_processed += 1;
                         }
                     },
@@ -176,7 +256,7 @@ pub const Socket = struct {
         }
     }
 
-    fn handlePacket(self: *Self, data: []const u8, from_addr: net.IpAddress) void {
+    fn handlePacket(self: *Self, data: []u8, from_addr: net.IpAddress) void {
         self.callback_mutex.lock(self.io) catch |err| {
             Logger.WARN("mutex lock failed: {}", .{err});
             return;
@@ -185,16 +265,7 @@ pub const Socket = struct {
         const context = self.context;
         self.callback_mutex.unlock(self.io);
 
-        if (callback) |cb| {
-            // Create a copy of the data that will be freed by the callback
-            const data_copy = self.allocator.dupe(u8, data) catch |err| {
-                std.log.err("Failed to copy packet data: {any}", .{err});
-                return;
-            };
-
-            // Call the callback - the callback MUST free the data_copy when done
-            cb(data_copy, from_addr, context, self.allocator);
-        }
+        if (callback) |cb| cb(data, from_addr, context, self.allocator);
     }
 
     const ReceiveResult = union(enum) {
