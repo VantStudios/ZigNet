@@ -1,5 +1,6 @@
 pub const Server = @import("./server/Server.zig").Server;
 pub const ServerOptions = @import("./server/Server.zig").ServerOptions;
+pub const MAX_MTU_SIZE = @import("./server/Server.zig").MAX_MTU_SIZE;
 pub const Connection = @import("./server/Connection.zig").Connection;
 
 pub const Socket = @import("./socket/socket.zig").Socket;
